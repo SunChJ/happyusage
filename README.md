@@ -1,8 +1,12 @@
 # happyusage
 
-Check your AI tool usage from the terminal. Built for humans and agents.
+Check your AI provider usage from the terminal. Built for humans and agents.
 
-> **For AI agents**: install with `brew tap SunChJ/happyusage && brew install hu`, then run `hu usage --agent` for compact plain-text output or `hu usage --json` for structured JSON. Single provider: `hu usage claude --agent`. List available providers: `hu usage list --json`.
+> **For AI agents**: install with the one-liner below, then use `hu usage --agent` for all providers or `hu usage <provider> --agent` for a specific one. Use `hu usage list` to discover available provider IDs.
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
+> ```
 
 ## Install
 
@@ -10,9 +14,6 @@ Check your AI tool usage from the terminal. Built for humans and agents.
 
 ```bash
 brew tap SunChJ/happyusage && brew install hu
-
-# upgrade
-brew update && brew upgrade hu
 ```
 
 **Shell script** (macOS / Linux)
@@ -27,14 +28,20 @@ curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/inst
 go install github.com/SunChJ/happyusage/cmd/hu@latest
 ```
 
+**Update**
+
+```bash
+hu update
+```
+
 ## Usage
 
 ```bash
-hu usage              # all providers, human-friendly
-hu usage claude       # single provider
-hu usage list         # list available provider IDs
-hu usage --agent      # compact agent-friendly text
-hu usage --json       # JSON output
+hu usage                        # all providers, human-friendly
+hu usage <provider>              # single provider
+hu usage list                    # list available provider IDs
+hu usage [provider] --agent      # compact text for AI agents
+hu usage [provider] --json       # structured JSON for web UI
 ```
 
 ## Supported providers
@@ -59,30 +66,25 @@ claude | session_left=77.0% | session_reset_in=4h25m | weekly_left=57.0% | weekl
   "source": "native_provider_scripts",
   "checked_at": "2026-04-13T07:36:02Z",
   "provider": {
-    "provider": "codex",
+    "provider": "claude",
     "ok": true,
-    "checked_at": "2026-04-13T07:36:04.118256+00:00",
-    "plan": "plus",
+    "plan": "Pro",
     "quotas": [
       {
         "name": "session",
         "period": "5h",
-        "used_pct": 0,
-        "left_pct": 100,
+        "used_pct": 25,
+        "left_pct": 75,
         "resets_at": "2026-04-13T12:36:03+00:00"
       },
       {
         "name": "weekly",
         "period": "7d",
-        "used_pct": 65,
-        "left_pct": 35,
+        "used_pct": 43,
+        "left_pct": 57,
         "resets_at": "2026-04-16T18:09:23+00:00"
       }
-    ],
-    "credits": {
-      "balance": "0",
-      "has_credits": false
-    }
+    ]
   }
 }
 ```
