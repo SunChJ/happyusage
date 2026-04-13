@@ -2,10 +2,16 @@
 
 Check your AI provider usage from the terminal. Built for humans and agents.
 
-> **For AI agents**: install with the one-liner below, then use `hu usage --agent` for all providers or `hu usage <provider> --agent` for a specific one. Use `hu usage list` to discover available provider IDs.
+> **For AI agents**:
 >
 > ```bash
+> # install
 > curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
+>
+> # query usage
+> hu usage --agent                 # all providers, compact text
+> hu usage <provider> --agent      # single provider
+> hu usage list                    # discover available provider IDs
 > ```
 
 ## Install
