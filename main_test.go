@@ -2,6 +2,12 @@ package happyusage
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -93,6 +99,130 @@ func TestIsNewerVersion(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecodeCodexUsage(t *testing.T) {
+	raw := map[string]any{
+		"plan_type": "plus",
+		"credits": map[string]any{"balance": float64(3)},
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{"used_percent": float64(25), "reset_at": float64(1893456000)},
+			"secondary_window": map[string]any{"used_percent": float64(55), "reset_at": "2030-01-01T00:00:00Z"},
+		},
+	}
+
+	got := decodeCodexUsage(raw)
+	if !got.OK || got.Provider != "codex" || got.Plan != "plus" {
+		t.Fatalf("unexpected provider usage: %+v", got)
+	}
+	if got.Credits["balance"] != "3" {
+		t.Fatalf("unexpected credits: %+v", got.Credits)
+	}
+	if len(got.Quotas) != 2 {
+		t.Fatalf("expected 2 quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "session" || got.Quotas[0].LeftPct == nil || *got.Quotas[0].LeftPct != 75 {
+		t.Fatalf("unexpected session quota: %+v", got.Quotas[0])
+	}
+	if got.Quotas[1].Name != "weekly" || got.Quotas[1].LeftPct == nil || *got.Quotas[1].LeftPct != 45 {
+		t.Fatalf("unexpected weekly quota: %+v", got.Quotas[1])
+	}
+}
+
+func TestCollectCodexUsageRefreshesToken(t *testing.T) {
+	oldClient := httpClient
+	oldUsageURL := codexUsageURL
+	oldTokenURL := codexTokenURL
+	oldHome := os.Getenv("CODEX_HOME")
+	defer func() {
+		httpClient = oldClient
+		codexUsageURL = oldUsageURL
+		codexTokenURL = oldTokenURL
+		_ = os.Setenv("CODEX_HOME", oldHome)
+	}()
+
+	var usageCalls int
+	refreshedAccessToken := jwtWithAccount("acct-123")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/usage":
+			usageCalls++
+			if got := r.Header.Get("Authorization"); usageCalls == 1 && got != "Bearer old-token" {
+				t.Fatalf("unexpected first auth header: %s", got)
+			}
+			if usageCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer "+refreshedAccessToken {
+				t.Fatalf("unexpected second auth header: %s", got)
+			}
+			if got := r.Header.Get("ChatGPT-Account-Id"); got != "acct-123" {
+				t.Fatalf("unexpected account header: %s", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"plan_type": "plus",
+				"credits": map[string]any{"balance": float64(0)},
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{"used_percent": float64(47), "reset_at": "2030-01-01T00:00:00Z"},
+					"secondary_window": map[string]any{"used_percent": float64(58), "reset_at": "2030-01-02T00:00:00Z"},
+				},
+			})
+		case "/token":
+			_ = r.ParseForm()
+			if r.Form.Get("refresh_token") != "refresh-1" {
+				t.Fatalf("unexpected refresh token: %s", r.Form.Get("refresh_token"))
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  jwtWithAccount("acct-123"),
+				"refresh_token": "refresh-2",
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	httpClient = server.Client()
+	codexUsageURL = server.URL + "/usage"
+	codexTokenURL = server.URL + "/token"
+
+	tmp := t.TempDir()
+	if err := os.Setenv("CODEX_HOME", tmp); err != nil {
+		t.Fatal(err)
+	}
+	auth := codexAuthFile{}
+	auth.Tokens.AccessToken = "old-token"
+	auth.Tokens.RefreshToken = "refresh-1"
+	if err := writeCodexAuthFile(filepath.Join(tmp, "auth.json"), auth); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := collectCodexUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || got.Plan != "plus" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if usageCalls != 2 {
+		t.Fatalf("expected 2 usage calls, got %d", usageCalls)
+	}
+	updated, err := readCodexAuthFile(filepath.Join(tmp, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Tokens.RefreshToken != "refresh-2" || updated.Tokens.AccessToken == "old-token" {
+		t.Fatalf("auth file not refreshed: %+v", updated)
+	}
+}
+
+func jwtWithAccount(accountID string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload, _ := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": accountID},
+	})
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
 
 func numPtr(v float64) *float64 { return &v }

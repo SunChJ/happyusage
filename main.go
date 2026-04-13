@@ -2,6 +2,7 @@ package happyusage
 
 import (
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,12 +10,13 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -107,7 +109,26 @@ type usageOptions struct {
 	Action string
 }
 
-var collectUsageFn = collectUsageViaScript
+type codexAuthFile struct {
+	OpenAIAPIKey string `json:"OPENAI_API_KEY,omitempty"`
+	AuthMode     string `json:"auth_mode,omitempty"`
+	Tokens       struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		AccountID    string `json:"account_id,omitempty"`
+		IDToken      string `json:"id_token,omitempty"`
+	} `json:"tokens"`
+	LastRefresh string `json:"last_refresh,omitempty"`
+}
+
+var (
+	collectUsageFn     = collectUsageHybrid
+	codexUsageURL      = "https://chatgpt.com/backend-api/wham/usage"
+	codexTokenURL      = "https://auth.openai.com/oauth/token"
+	codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+	httpClient         = &http.Client{Timeout: 15 * time.Second}
+	allProviders       = []string{"claude", "codex", "cursor", "copilot", "gemini", "windsurf"}
+)
 
 func Main(progName string, args []string) int {
 	return MainWithIO(progName, args, os.Stdout, os.Stderr)
@@ -299,10 +320,52 @@ func (a app) renderUsageError(opts usageOptions, err error) int {
 	return a.exitErr(err)
 }
 
-func collectUsageViaScript(targets []string) ([]providerUsage, error) {
+func collectUsageHybrid(targets []string) ([]providerUsage, error) {
 	if runtime.GOOS != "darwin" {
 		return nil, errors.New("native provider scripts currently support macOS only")
 	}
+
+	requested := normalizeTargets(targets)
+	results := make([]providerUsage, 0, len(requested))
+	scriptTargets := make([]string, 0, len(requested))
+	seen := make(map[string]bool, len(requested))
+
+	for _, target := range requested {
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		switch target {
+		case "codex":
+			result, err := collectCodexUsage()
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+		default:
+			scriptTargets = append(scriptTargets, target)
+		}
+	}
+
+	if len(scriptTargets) > 0 {
+		scriptResults, err := collectUsageViaScript(scriptTargets)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, scriptResults...)
+	}
+
+	return results, nil
+}
+
+func normalizeTargets(targets []string) []string {
+	if len(targets) == 0 {
+		return append([]string(nil), allProviders...)
+	}
+	return targets
+}
+
+func collectUsageViaScript(targets []string) ([]providerUsage, error) {
 	scriptPath, cleanup, err := materializeScript()
 	if err != nil {
 		return nil, err
@@ -424,6 +487,289 @@ func readNumberPtr(v any) *float64 {
 		return nil
 	default:
 		return nil
+	}
+}
+
+func collectCodexUsage() (providerUsage, error) {
+	authPath := filepath.Join(os.Getenv("HOME"), ".codex", "auth.json")
+	if home := os.Getenv("CODEX_HOME"); home != "" {
+		authPath = filepath.Join(home, "auth.json")
+	}
+
+	auth, err := readCodexAuthFile(authPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return providerUsage{Provider: "codex", OK: false, Error: "auth file not found"}, nil
+		}
+		return providerUsage{}, err
+	}
+	if auth.Tokens.AccessToken == "" && auth.Tokens.RefreshToken == "" {
+		return providerUsage{Provider: "codex", OK: false, Error: "no token found"}, nil
+	}
+
+	usage, token, refreshToken, err := fetchCodexUsage(auth)
+	if err != nil {
+		return providerUsage{Provider: "codex", OK: false, Error: err.Error()}, nil
+	}
+	if refreshToken != "" && (token != auth.Tokens.AccessToken || refreshToken != auth.Tokens.RefreshToken) {
+		auth.Tokens.AccessToken = token
+		auth.Tokens.RefreshToken = refreshToken
+		auth.Tokens.AccountID = codexAccountID(token)
+		auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
+		if err := writeCodexAuthFile(authPath, auth); err != nil {
+			return providerUsage{}, err
+		}
+	}
+
+	return decodeCodexUsage(usage), nil
+}
+
+func readCodexAuthFile(path string) (codexAuthFile, error) {
+	var auth codexAuthFile
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return auth, err
+	}
+	err = json.Unmarshal(data, &auth)
+	return auth, err
+}
+
+func writeCodexAuthFile(path string, auth codexAuthFile) error {
+	data, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func fetchCodexUsage(auth codexAuthFile) (map[string]any, string, string, error) {
+	accessToken := auth.Tokens.AccessToken
+	refreshToken := auth.Tokens.RefreshToken
+	accountID := auth.Tokens.AccountID
+	if accountID == "" {
+		accountID = codexAccountID(accessToken)
+	}
+
+	body, status, err := doCodexUsageRequest(accessToken, accountID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if status == http.StatusUnauthorized && refreshToken != "" {
+		newAccess, newRefresh, err := refreshCodexAccessToken(refreshToken)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if newAccess == "" {
+			return nil, "", "", errors.New("codex: token refresh returned empty access token")
+		}
+		accessToken = newAccess
+		if newRefresh != "" {
+			refreshToken = newRefresh
+		}
+		accountID = codexAccountID(accessToken)
+		body, status, err = doCodexUsageRequest(accessToken, accountID)
+		if err != nil {
+			return nil, "", "", err
+		}
+	}
+	if status != http.StatusOK {
+		return nil, "", "", fmt.Errorf("api returned HTTP %d", status)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, "", "", fmt.Errorf("parse failed: %w", err)
+	}
+	return raw, accessToken, refreshToken, nil
+}
+
+func doCodexUsageRequest(accessToken, accountID string) ([]byte, int, error) {
+	if accessToken == "" {
+		return nil, 0, errors.New("no token found")
+	}
+	req, err := http.NewRequest(http.MethodGet, codexUsageURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+func refreshCodexAccessToken(refreshToken string) (string, string, error) {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("client_id", codexOAuthClientID)
+	form.Set("refresh_token", refreshToken)
+	req, err := http.NewRequest(http.MethodPost, codexTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("token refresh failed with HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", "", err
+	}
+	return parsed.AccessToken, parsed.RefreshToken, nil
+}
+
+func codexAccountID(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return ""
+	}
+	auth, _ := raw["https://api.openai.com/auth"].(map[string]any)
+	if auth == nil {
+		return ""
+	}
+	accountID, _ := auth["chatgpt_account_id"].(string)
+	return accountID
+}
+
+func decodeCodexUsage(raw map[string]any) providerUsage {
+	result := providerUsage{
+		Provider:  "codex",
+		OK:        true,
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		Plan:      stringField(raw, "plan_type"),
+		Credits: map[string]any{
+			"balance": numberString(nestedMap(raw, "credits")["balance"]),
+		},
+	}
+
+	result.Quotas = append(result.Quotas, decodeCodexWindow("session", "5h", nestedMap(nestedMap(raw, "rate_limit"), "primary_window"))...)
+	result.Quotas = append(result.Quotas, decodeCodexWindow("weekly", "7d", nestedMap(nestedMap(raw, "rate_limit"), "secondary_window"))...)
+
+	for _, entry := range sliceMap(raw["additional_rate_limits"]) {
+		name := stringField(entry, "limit_name")
+		if name == "" {
+			name = "model"
+		}
+		rateLimit := nestedMap(entry, "rate_limit")
+		result.Quotas = append(result.Quotas, decodeCodexWindow(name, "5h", nestedMap(rateLimit, "primary_window"))...)
+		result.Quotas = append(result.Quotas, decodeCodexWindow(name+"_weekly", "7d", nestedMap(rateLimit, "secondary_window"))...)
+	}
+
+	return result
+}
+
+func decodeCodexWindow(name, period string, window map[string]any) []quota {
+	used, ok := numberValue(window["used_percent"])
+	if !ok {
+		return nil
+	}
+	left := math.Round((100-used)*10) / 10
+	q := quota{Name: name, Period: period, UsedPct: &used, LeftPct: &left}
+	if resetAt := codexResetAt(window["reset_at"]); resetAt != "" {
+		q.ResetsAt = resetAt
+	}
+	return []quota{q}
+}
+
+func codexResetAt(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		if t <= 0 {
+			return ""
+		}
+		return time.Unix(int64(t), 0).UTC().Format(time.RFC3339)
+	default:
+		return ""
+	}
+}
+
+func nestedMap(m map[string]any, key string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	child, _ := m[key].(map[string]any)
+	return child
+}
+
+func sliceMap(v any) []map[string]any {
+	items, _ := v.([]any)
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	value, _ := m[key].(string)
+	return value
+}
+
+func numberValue(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case json.Number:
+		value, err := n.Float64()
+		return value, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func numberString(v any) string {
+	switch n := v.(type) {
+	case string:
+		return n
+	case float64:
+		if n == math.Trunc(n) {
+			return strconv.FormatInt(int64(n), 10)
+		}
+		return strconv.FormatFloat(n, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(n)
+	case json.Number:
+		return n.String()
+	default:
+		return fmt.Sprintf("%v", v)
 	}
 }
 
