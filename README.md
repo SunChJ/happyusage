@@ -1,11 +1,11 @@
 # happyusage-cli
 
-Tiny cross-platform CLI for checking local AI tool usage.
+A tiny cross-platform CLI for checking local AI tool usage.
 
-它分成两层：
+The project is designed for two audiences:
 
-- **human**：默认可读、带一点可视化
-- **agent**：`--agent` 精简文本，`--json` 结构化输出
+- **humans** — readable default output with lightweight visual cues
+- **agents** — compact text via `--agent` and structured output via `--json`
 
 ## Install
 
@@ -27,15 +27,15 @@ go install github.com/SunChJ/happyusage-cli/cmd/hu@latest
 go build -o bin/hu ./cmd/hu
 ```
 
-## Commands
+## Quick start
 
-直接输入：
+Run the command with no arguments to see the built-in help:
 
 ```bash
 hu
 ```
 
-会显示帮助。
+## Commands
 
 ### Help
 
@@ -52,32 +52,32 @@ hu version
 
 ### Usage
 
-默认展示所有已配置 provider 的人类可读用量视图：
+Show all configured providers in the default human-friendly view:
 
 ```bash
 hu usage
 ```
 
-列出当前可读到的 providerId：
+List provider IDs currently available from the local API:
 
 ```bash
 hu usage list
 ```
 
-查看单个 provider：
+Show a single provider:
 
 ```bash
 hu usage claude
 hu usage codex
 ```
 
-agent 友好精简文本：
+Show compact agent-friendly text:
 
 ```bash
 hu usage claude --agent
 ```
 
-JSON 输出：
+Show JSON output:
 
 ```bash
 hu usage claude --json
@@ -85,7 +85,7 @@ hu usage --json
 hu usage list --json
 ```
 
-### Flags
+## Flags
 
 ```bash
 --base-url   custom local API base URL
@@ -96,7 +96,7 @@ hu usage list --json
 
 ## Data source
 
-当前版本默认从本地 usage HTTP API 读取：
+The current version reads from a local usage HTTP API:
 
 - `GET http://127.0.0.1:6736/v1/usage`
 - `GET http://127.0.0.1:6736/v1/usage/:providerId`
@@ -146,7 +146,7 @@ go run ./cmd/hu usage claude --json
 ## Roadmap
 
 - native provider fallback probes
-- release binaries for macOS / Linux / Windows
+- release binaries for macOS, Linux, and Windows
 - Homebrew first, then Scoop / winget
 
 ## License
