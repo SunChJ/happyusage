@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,26 +123,51 @@ func (a app) run(args []string) int {
 		return 0
 	}
 
+	// Start async update check for human-facing commands
+	var updateCh <-chan string
+	if !isQuietMode(args) {
+		updateCh = checkUpdateAsync()
+	}
+
+	var exitCode int
 	switch args[0] {
 	case "help", "-h", "--help":
 		if len(args) > 1 && args[1] == "usage" {
 			a.printUsageHelp()
-			return 0
+		} else {
+			a.printHelp()
 		}
-		a.printHelp()
-		return 0
 	case "version", "--version", "-v":
 		fmt.Fprintln(a.stdout, Version)
-		return 0
 	case "usage":
 		opts, err := parseUsageArgs(args[1:])
 		if err != nil {
 			return a.exitErr(err)
 		}
-		return a.runUsage(opts)
+		exitCode = a.runUsage(opts)
+	case "update":
+		return a.runUpdate()
 	default:
 		return a.exitErr(fmt.Errorf("unknown command: %s", args[0]))
 	}
+
+	// Show update hint if available
+	if updateCh != nil {
+		if latest := <-updateCh; latest != "" {
+			fmt.Fprintf(a.stderr, "\n💡 A new version is available: %s (current: %s)\n", latest, Version)
+			fmt.Fprintf(a.stderr, "   Run 'hu update' to upgrade.\n")
+		}
+	}
+	return exitCode
+}
+
+func isQuietMode(args []string) bool {
+	for _, arg := range args {
+		if arg == "--agent" || arg == "--json" || arg == "update" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseUsageArgs(args []string) (usageOptions, error) {
@@ -412,6 +438,7 @@ func (a app) printHelp() {
 	fmt.Fprintf(a.stdout, "  %s usage --json                  structured JSON for web UI\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage claude --agent          single provider, agent format\n\n", a.progName)
 	fmt.Fprintf(a.stdout, "Other:\n")
+	fmt.Fprintf(a.stdout, "  %s update                        update to latest version\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s help [command]                show help\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s version                       show version\n\n", a.progName)
 	fmt.Fprintf(a.stdout, "Providers: claude, codex, cursor, copilot, gemini, windsurf\n")
@@ -639,4 +666,159 @@ func (a app) writeJSON(v any) {
 func (a app) exitErr(err error) int {
 	fmt.Fprintln(a.stderr, "error:", err)
 	return 1
+}
+
+// --- update check ---
+
+func cacheDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".happyusage")
+}
+
+func cacheFile() string {
+	return filepath.Join(cacheDir(), "latest-version")
+}
+
+type versionCache struct {
+	Version   string `json:"version"`
+	CheckedAt int64  `json:"checked_at"`
+}
+
+func readCache() (string, bool) {
+	data, err := os.ReadFile(cacheFile())
+	if err != nil {
+		return "", false
+	}
+	var c versionCache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return "", false
+	}
+	if time.Now().Unix()-c.CheckedAt > 86400 {
+		return "", false
+	}
+	return c.Version, true
+}
+
+func writeCache(version string) {
+	_ = os.MkdirAll(cacheDir(), 0o755)
+	data, _ := json.Marshal(versionCache{Version: version, CheckedAt: time.Now().Unix()})
+	_ = os.WriteFile(cacheFile(), data, 0o644)
+}
+
+func fetchLatestVersion() string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/SunChJ/happyusage/releases/latest", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return ""
+	}
+	return release.TagName
+}
+
+func checkUpdateAsync() <-chan string {
+	ch := make(chan string, 1)
+	if Version == "dev" {
+		ch <- ""
+		return ch
+	}
+	go func() {
+		latest, ok := readCache()
+		if !ok {
+			latest = fetchLatestVersion()
+			if latest != "" {
+				writeCache(latest)
+			}
+		}
+		if latest != "" && latest != Version {
+			ch <- latest
+		} else {
+			ch <- ""
+		}
+	}()
+	return ch
+}
+
+// --- hu update ---
+
+func (a app) runUpdate() int {
+	latest := fetchLatestVersion()
+	if latest == "" {
+		return a.exitErr(fmt.Errorf("failed to check for updates"))
+	}
+	if latest == Version {
+		fmt.Fprintf(a.stdout, "Already up to date (%s).\n", Version)
+		return 0
+	}
+
+	fmt.Fprintf(a.stdout, "Updating %s → %s\n", Version, latest)
+
+	// Detect install method and update
+	if path, err := exec.LookPath("hu"); err == nil {
+		if strings.Contains(path, "homebrew") || strings.Contains(path, "Cellar") {
+			return a.updateViaBrew()
+		}
+	}
+	if _, err := exec.LookPath("go"); err == nil {
+		if gopath := os.Getenv("GOPATH"); gopath != "" {
+			if exePath, _ := os.Executable(); strings.HasPrefix(exePath, gopath) {
+				return a.updateViaGo()
+			}
+		}
+		if home, _ := os.UserHomeDir(); home != "" {
+			if exePath, _ := os.Executable(); strings.HasPrefix(exePath, filepath.Join(home, "go")) {
+				return a.updateViaGo()
+			}
+		}
+	}
+	return a.updateViaScript()
+}
+
+func (a app) updateViaBrew() int {
+	fmt.Fprintln(a.stdout, "Updating via Homebrew...")
+	cmd := exec.Command("brew", "update")
+	cmd.Stdout = a.stdout
+	cmd.Stderr = a.stderr
+	_ = cmd.Run()
+	cmd = exec.Command("brew", "upgrade", "hu")
+	cmd.Stdout = a.stdout
+	cmd.Stderr = a.stderr
+	if err := cmd.Run(); err != nil {
+		return a.exitErr(fmt.Errorf("brew upgrade failed: %w", err))
+	}
+	fmt.Fprintln(a.stdout, "Done.")
+	return 0
+}
+
+func (a app) updateViaGo() int {
+	fmt.Fprintln(a.stdout, "Updating via go install...")
+	cmd := exec.Command("go", "install", "github.com/SunChJ/happyusage/cmd/hu@latest")
+	cmd.Stdout = a.stdout
+	cmd.Stderr = a.stderr
+	if err := cmd.Run(); err != nil {
+		return a.exitErr(fmt.Errorf("go install failed: %w", err))
+	}
+	fmt.Fprintln(a.stdout, "Done.")
+	return 0
+}
+
+func (a app) updateViaScript() int {
+	fmt.Fprintln(a.stdout, "Updating via install script...")
+	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh")
+	cmd.Stdout = a.stdout
+	cmd.Stderr = a.stderr
+	if err := cmd.Run(); err != nil {
+		return a.exitErr(fmt.Errorf("script update failed: %w", err))
+	}
+	fmt.Fprintln(a.stdout, "Done.")
+	return 0
 }
