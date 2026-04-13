@@ -58,7 +58,7 @@ Show all configured providers in the default human-friendly view:
 hu usage
 ```
 
-List provider IDs currently available from the local API:
+List provider IDs currently available from the built-in provider probes:
 
 ```bash
 hu usage list
@@ -87,51 +87,54 @@ hu usage list --json
 
 ## Flags
 
+These flags currently apply to `hu usage`:
+
 ```bash
---base-url   custom local API base URL
---timeout    HTTP timeout
---agent      compact agent-friendly text
---json       JSON envelope
+--agent   compact agent-friendly text
+--json    JSON envelope
 ```
 
-## Data source
+## Data collection model
 
-The current version reads from a local usage HTTP API:
+`hu` does not depend on a running desktop app or any external local usage API.
 
-- `GET http://127.0.0.1:6736/v1/usage`
-- `GET http://127.0.0.1:6736/v1/usage/:providerId`
+The current implementation ships with built-in native provider collection scripts,
+primarily tuned for macOS first. The bundled probe set currently covers:
+
+- Claude
+- Codex
+- Cursor
+- Copilot
+- Gemini
+- Windsurf
 
 ## Example JSON
 
 ```json
 {
   "ok": true,
-  "source": "local_usage_http_api",
-  "base_url": "http://127.0.0.1:6736",
+  "source": "native_provider_scripts",
   "checked_at": "2026-04-13T03:00:00Z",
   "provider": {
-    "provider_id": "claude",
-    "display_name": "Claude",
+    "provider": "claude",
+    "ok": true,
     "plan": "Pro",
-    "progress": [
+    "quotas": [
       {
-        "label": "Session",
-        "used": 25,
-        "limit": 100,
-        "remaining": 75,
-        "percent_used": 25,
-        "unit": "percent"
-      }
-    ],
-    "texts": [
-      {
-        "label": "Today",
-        "value": "$2.10 · 3M tokens"
+        "name": "session",
+        "period": "5h",
+        "used_pct": 25,
+        "left_pct": 75
       }
     ]
   }
 }
 ```
+
+## Platform status
+
+- **macOS** — first-class target for the current native probes
+- **Linux / Windows** — installation is supported, but provider collection is not yet at feature parity
 
 ## Development
 
@@ -145,7 +148,8 @@ go run ./cmd/hu usage claude --json
 
 ## Roadmap
 
-- native provider fallback probes
+- replace shell-heavy probes with native Go implementations where it makes sense
+- expand Linux and Windows collection support
 - release binaries for macOS, Linux, and Windows
 - Homebrew first, then Scoop / winget
 

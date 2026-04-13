@@ -1,94 +1,60 @@
 package happyusage
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 )
 
-const defaultBaseURL = "http://127.0.0.1:6736"
-
 var Version = "dev"
 
-type apiSnapshot struct {
-	ProviderID  string       `json:"providerId"`
-	DisplayName string       `json:"displayName"`
-	Plan        string       `json:"plan"`
-	Lines       []metricLine `json:"lines"`
-	FetchedAt   string       `json:"fetchedAt"`
+//go:embed scripts/check-usage-agent.sh
+var embeddedAgentScript string
+
+type quota struct {
+	Name         string   `json:"name"`
+	Period       string   `json:"period,omitempty"`
+	UsedPct      *float64 `json:"used_pct,omitempty"`
+	LeftPct      *float64 `json:"left_pct,omitempty"`
+	ResetsAt     string   `json:"resets_at,omitempty"`
+	Remaining    *float64 `json:"remaining,omitempty"`
+	Total        *float64 `json:"total,omitempty"`
+	UsedDollars  *float64 `json:"used_dollars,omitempty"`
+	LimitDollars *float64 `json:"limit_dollars,omitempty"`
 }
 
-type metricLine struct {
-	Type             string      `json:"type"`
-	Label            string      `json:"label"`
-	Used             float64     `json:"used,omitempty"`
-	Limit            float64     `json:"limit,omitempty"`
-	Format           *lineFormat `json:"format,omitempty"`
-	ResetsAt         string      `json:"resetsAt,omitempty"`
-	PeriodDurationMs int64       `json:"periodDurationMs,omitempty"`
-	Color            string      `json:"color,omitempty"`
-	Value            string      `json:"value,omitempty"`
-	Text             string      `json:"text,omitempty"`
-	Subtitle         string      `json:"subtitle,omitempty"`
-}
-
-type lineFormat struct {
-	Kind   string `json:"kind"`
-	Suffix string `json:"suffix,omitempty"`
-}
-
-type normalizedProgress struct {
-	Label            string   `json:"label"`
-	Used             float64  `json:"used"`
-	Limit            float64  `json:"limit"`
-	Remaining        *float64 `json:"remaining,omitempty"`
-	PercentUsed      *float64 `json:"percent_used,omitempty"`
-	Unit             string   `json:"unit,omitempty"`
-	ResetsAt         string   `json:"resets_at,omitempty"`
-	PeriodDurationMs int64    `json:"period_duration_ms,omitempty"`
-}
-
-type normalizedText struct {
-	Label    string `json:"label"`
-	Value    string `json:"value"`
-	Subtitle string `json:"subtitle,omitempty"`
-}
-
-type normalizedBadge struct {
-	Label    string `json:"label"`
-	Text     string `json:"text"`
-	Subtitle string `json:"subtitle,omitempty"`
-}
-
-type normalizedSnapshot struct {
-	ProviderID      string               `json:"provider_id"`
-	DisplayName     string               `json:"display_name"`
-	Plan            string               `json:"plan,omitempty"`
-	FetchedAt       string               `json:"fetched_at,omitempty"`
-	Progress        []normalizedProgress `json:"progress,omitempty"`
-	Texts           []normalizedText     `json:"texts,omitempty"`
-	Badges          []normalizedBadge    `json:"badges,omitempty"`
-	PrimaryProgress *normalizedProgress  `json:"primary_progress,omitempty"`
+type providerUsage struct {
+	Provider          string         `json:"provider"`
+	OK                bool           `json:"ok"`
+	Error             string         `json:"error,omitempty"`
+	CheckedAt         string         `json:"checked_at,omitempty"`
+	Plan              string         `json:"plan,omitempty"`
+	Quotas            []quota        `json:"quotas,omitempty"`
+	Credits           map[string]any `json:"credits,omitempty"`
+	ExtraUsage        map[string]any `json:"extra_usage,omitempty"`
+	ExtraUsageBalance map[string]any `json:"extra_usage_balance,omitempty"`
+	Raw               map[string]any `json:"-"`
 }
 
 type jsonEnvelope struct {
-	OK            bool                 `json:"ok"`
-	Source        string               `json:"source"`
-	BaseURL       string               `json:"base_url"`
-	CheckedAt     string               `json:"checked_at"`
-	ProviderCount int                  `json:"provider_count,omitempty"`
-	Providers     []normalizedSnapshot `json:"providers,omitempty"`
-	Provider      *normalizedSnapshot  `json:"provider,omitempty"`
-	Error         string               `json:"error,omitempty"`
-	Message       string               `json:"message,omitempty"`
+	OK            bool            `json:"ok"`
+	Source        string          `json:"source"`
+	CheckedAt     string          `json:"checked_at"`
+	ProviderCount int             `json:"provider_count,omitempty"`
+	Providers     []providerUsage `json:"providers,omitempty"`
+	Provider      *providerUsage  `json:"provider,omitempty"`
+	Error         string          `json:"error,omitempty"`
 }
 
 type app struct {
@@ -98,25 +64,24 @@ type app struct {
 }
 
 type usageOptions struct {
-	BaseURL string
-	Timeout time.Duration
-	JSON    bool
-	Agent   bool
-	Target  string
-	Action  string
+	JSON   bool
+	Agent  bool
+	Target string
+	Action string
 }
+
+var collectUsageFn = collectUsageViaScript
 
 func Main(progName string, args []string) int {
-	client := &http.Client{Timeout: 5 * time.Second}
-	return MainWithIO(progName, args, os.Stdout, os.Stderr, client)
+	return MainWithIO(progName, args, os.Stdout, os.Stderr)
 }
 
-func MainWithIO(progName string, args []string, stdout, stderr io.Writer, client *http.Client) int {
+func MainWithIO(progName string, args []string, stdout, stderr io.Writer) int {
 	a := app{progName: progName, stdout: stdout, stderr: stderr}
-	return a.run(args, client)
+	return a.run(args)
 }
 
-func (a app) run(args []string, client *http.Client) int {
+func (a app) run(args []string) int {
 	if len(args) == 0 {
 		a.printHelp()
 		return 0
@@ -138,8 +103,7 @@ func (a app) run(args []string, client *http.Client) int {
 		if err != nil {
 			return a.exitErr(err)
 		}
-		client.Timeout = opts.Timeout
-		return a.runUsage(client, opts)
+		return a.runUsage(opts)
 	default:
 		return a.exitErr(fmt.Errorf("unknown command: %s", args[0]))
 	}
@@ -148,36 +112,23 @@ func (a app) run(args []string, client *http.Client) int {
 func parseUsageArgs(args []string) (usageOptions, error) {
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	baseURL := fs.String("base-url", defaultBaseURL, "Local usage API base URL")
-	timeout := fs.Duration("timeout", 5*time.Second, "HTTP timeout")
 	jsonOut := fs.Bool("json", false, "emit JSON envelope")
 	agentOut := fs.Bool("agent", false, "emit compact agent-friendly text")
 
 	flagArgs := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
+	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") {
 			flagArgs = append(flagArgs, arg)
-			if (arg == "--base-url" || arg == "--timeout") && i+1 < len(args) {
-				i++
-				flagArgs = append(flagArgs, args[i])
-			}
-			continue
+		} else {
+			positionals = append(positionals, arg)
 		}
-		positionals = append(positionals, arg)
 	}
-
 	if err := fs.Parse(flagArgs); err != nil {
 		return usageOptions{}, err
 	}
-	opts := usageOptions{
-		BaseURL: strings.TrimRight(*baseURL, "/"),
-		Timeout: *timeout,
-		JSON:    *jsonOut,
-		Agent:   *agentOut,
-		Action:  "all",
-	}
+
+	opts := usageOptions{JSON: *jsonOut, Agent: *agentOut, Action: "all"}
 	if len(positionals) > 0 {
 		if positionals[0] == "list" {
 			opts.Action = "list"
@@ -189,163 +140,214 @@ func parseUsageArgs(args []string) (usageOptions, error) {
 	return opts, nil
 }
 
-func (a app) runUsage(client *http.Client, opts usageOptions) int {
+func (a app) runUsage(opts usageOptions) int {
 	now := time.Now().UTC().Format(time.RFC3339)
+
 	switch opts.Action {
-	case "list":
-		providers, err := fetchAll(client, opts.BaseURL)
-		if err != nil {
-			return a.renderUsageError(opts, err)
-		}
-		normalized := normalizeSnapshots(providers)
-		if opts.JSON {
-			a.writeJSON(jsonEnvelope{OK: true, Source: "local_usage_http_api", BaseURL: opts.BaseURL, CheckedAt: now, ProviderCount: len(normalized), Providers: normalized})
-			return 0
-		}
-		for _, provider := range normalized {
-			fmt.Fprintln(a.stdout, provider.ProviderID)
-		}
-		return 0
 	case "provider":
-		snapshot, err := fetchOne(client, opts.BaseURL, opts.Target)
+		results, err := collectUsageFn([]string{opts.Target})
 		if err != nil {
 			return a.renderUsageError(opts, err)
 		}
-		normalized := normalizeSnapshot(snapshot)
+		if len(results) == 0 {
+			return a.renderUsageError(opts, fmt.Errorf("provider not found: %s", opts.Target))
+		}
+		provider := results[0]
 		if opts.JSON {
-			a.writeJSON(jsonEnvelope{OK: true, Source: "local_usage_http_api", BaseURL: opts.BaseURL, CheckedAt: now, Provider: &normalized})
-			return 0
+			a.writeJSON(jsonEnvelope{OK: provider.OK, Source: "native_provider_scripts", CheckedAt: now, Provider: &provider, Error: provider.Error})
+			if provider.OK {
+				return 0
+			}
+			return 1
+		}
+		if !provider.OK {
+			return a.exitErr(fmt.Errorf("%s: %s", provider.Provider, provider.Error))
 		}
 		if opts.Agent {
-			a.printAgentProvider(normalized)
+			a.printAgentProvider(provider)
 			return 0
 		}
-		a.printHumanProviders([]normalizedSnapshot{normalized})
+		a.printHumanProviders([]providerUsage{provider})
+		return 0
+	case "list":
+		results, err := collectUsageFn(nil)
+		if err != nil {
+			return a.renderUsageError(opts, err)
+		}
+		configured := configuredProviders(results)
+		if opts.JSON {
+			a.writeJSON(jsonEnvelope{OK: true, Source: "native_provider_scripts", CheckedAt: now, ProviderCount: len(configured), Providers: configured})
+			return 0
+		}
+		for _, provider := range configured {
+			fmt.Fprintln(a.stdout, provider.Provider)
+		}
 		return 0
 	default:
-		providers, err := fetchAll(client, opts.BaseURL)
+		results, err := collectUsageFn(nil)
 		if err != nil {
 			return a.renderUsageError(opts, err)
 		}
-		normalized := normalizeSnapshots(providers)
+		configured := configuredProviders(results)
 		if opts.JSON {
-			a.writeJSON(jsonEnvelope{OK: true, Source: "local_usage_http_api", BaseURL: opts.BaseURL, CheckedAt: now, ProviderCount: len(normalized), Providers: normalized})
+			a.writeJSON(jsonEnvelope{OK: true, Source: "native_provider_scripts", CheckedAt: now, ProviderCount: len(configured), Providers: configured})
 			return 0
 		}
 		if opts.Agent {
-			for _, provider := range normalized {
+			for _, provider := range configured {
 				a.printAgentProvider(provider)
 			}
 			return 0
 		}
-		a.printHumanProviders(normalized)
+		a.printHumanProviders(configured)
 		return 0
 	}
 }
 
+func configuredProviders(results []providerUsage) []providerUsage {
+	configured := make([]providerUsage, 0, len(results))
+	for _, result := range results {
+		if result.OK {
+			configured = append(configured, result)
+		}
+	}
+	sort.Slice(configured, func(i, j int) bool { return configured[i].Provider < configured[j].Provider })
+	return configured
+}
+
 func (a app) renderUsageError(opts usageOptions, err error) int {
 	if opts.JSON {
-		a.writeJSON(jsonEnvelope{OK: false, Source: "local_usage_http_api", BaseURL: opts.BaseURL, CheckedAt: time.Now().UTC().Format(time.RFC3339), Error: err.Error()})
+		a.writeJSON(jsonEnvelope{OK: false, Source: "native_provider_scripts", CheckedAt: time.Now().UTC().Format(time.RFC3339), Error: err.Error()})
 		return 1
 	}
 	return a.exitErr(err)
 }
 
-func fetchAll(client *http.Client, baseURL string) ([]apiSnapshot, error) {
-	resp, err := client.Get(baseURL + "/v1/usage")
+func collectUsageViaScript(targets []string) ([]providerUsage, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, errors.New("native provider scripts currently support macOS only")
+	}
+	scriptPath, cleanup, err := materializeScript()
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, parseAPIError(resp)
+	defer cleanup()
+
+	args := []string{scriptPath, "--raw"}
+	args = append(args, targets...)
+	cmd := exec.Command("bash", args...)
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("script execution failed: %v: %s", err, strings.TrimSpace(string(output)))
 	}
-	var snapshots []apiSnapshot
-	if err := json.NewDecoder(resp.Body).Decode(&snapshots); err != nil {
-		return nil, fmt.Errorf("invalid JSON from /v1/usage: %w", err)
+
+	payload := extractJSONArray(output)
+	var raw []map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse script output: %w", err)
 	}
-	return snapshots, nil
+	results := make([]providerUsage, 0, len(raw))
+	for _, item := range raw {
+		results = append(results, decodeProviderUsage(item))
+	}
+	return results, nil
 }
 
-func fetchOne(client *http.Client, baseURL, provider string) (apiSnapshot, error) {
-	resp, err := client.Get(baseURL + "/v1/usage/" + provider)
+func materializeScript() (string, func(), error) {
+	dir, err := os.MkdirTemp("", "happyusage-*")
 	if err != nil {
-		return apiSnapshot{}, fmt.Errorf("request failed: %w", err)
+		return "", nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent {
-		return apiSnapshot{}, errors.New("provider has no cached snapshot yet")
+	path := filepath.Join(dir, "check-usage-agent.sh")
+	if err := os.WriteFile(path, []byte(embeddedAgentScript), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return apiSnapshot{}, parseAPIError(resp)
-	}
-	var snapshot apiSnapshot
-	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
-		return apiSnapshot{}, fmt.Errorf("invalid JSON from /v1/usage/%s: %w", provider, err)
-	}
-	return snapshot, nil
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	return path, cleanup, nil
 }
 
-func parseAPIError(resp *http.Response) error {
-	body, _ := io.ReadAll(resp.Body)
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err == nil {
-		if code, ok := payload["error"].(string); ok && code != "" {
-			if resp.StatusCode == http.StatusNotFound {
-				return fmt.Errorf("provider not found: %s", code)
+func extractJSONArray(output []byte) []byte {
+	text := strings.TrimSpace(string(output))
+	start := strings.Index(text, "[")
+	end := strings.LastIndex(text, "]")
+	if start >= 0 && end >= start {
+		return []byte(text[start : end+1])
+	}
+	return output
+}
+
+func decodeProviderUsage(item map[string]any) providerUsage {
+	result := providerUsage{Raw: item}
+	if v, ok := item["provider"].(string); ok {
+		result.Provider = v
+	}
+	if v, ok := item["ok"].(bool); ok {
+		result.OK = v
+	}
+	if v, ok := item["error"].(string); ok {
+		result.Error = v
+	}
+	if v, ok := item["checked_at"].(string); ok {
+		result.CheckedAt = v
+	}
+	if v, ok := item["plan"].(string); ok {
+		result.Plan = v
+	}
+	if v, ok := item["credits"].(map[string]any); ok {
+		result.Credits = v
+	}
+	if v, ok := item["extra_usage"].(map[string]any); ok {
+		result.ExtraUsage = v
+	}
+	if v, ok := item["extra_usage_balance"].(map[string]any); ok {
+		result.ExtraUsageBalance = v
+	}
+	if arr, ok := item["quotas"].([]any); ok {
+		for _, elem := range arr {
+			qMap, ok := elem.(map[string]any)
+			if !ok {
+				continue
 			}
-			return fmt.Errorf("api error (%d): %s", resp.StatusCode, code)
+			result.Quotas = append(result.Quotas, decodeQuota(qMap))
 		}
 	}
-	return fmt.Errorf("api error (%d)", resp.StatusCode)
+	return result
 }
 
-func normalizeSnapshots(in []apiSnapshot) []normalizedSnapshot {
-	out := make([]normalizedSnapshot, 0, len(in))
-	for _, snapshot := range in {
-		out = append(out, normalizeSnapshot(snapshot))
+func decodeQuota(item map[string]any) quota {
+	q := quota{}
+	if v, ok := item["name"].(string); ok {
+		q.Name = v
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ProviderID < out[j].ProviderID })
-	return out
+	if v, ok := item["period"].(string); ok {
+		q.Period = v
+	}
+	q.UsedPct = readNumberPtr(item["used_pct"])
+	q.LeftPct = readNumberPtr(item["left_pct"])
+	q.Remaining = readNumberPtr(item["remaining"])
+	q.Total = readNumberPtr(item["total"])
+	q.UsedDollars = readNumberPtr(item["used_dollars"])
+	q.LimitDollars = readNumberPtr(item["limit_dollars"])
+	if v, ok := item["resets_at"].(string); ok {
+		q.ResetsAt = v
+	}
+	return q
 }
 
-func normalizeSnapshot(in apiSnapshot) normalizedSnapshot {
-	out := normalizedSnapshot{ProviderID: in.ProviderID, DisplayName: in.DisplayName, Plan: in.Plan, FetchedAt: in.FetchedAt}
-	for _, line := range in.Lines {
-		switch line.Type {
-		case "progress":
-			p := normalizedProgress{Label: line.Label, Used: line.Used, Limit: line.Limit, Unit: unitFor(line.Format), ResetsAt: line.ResetsAt, PeriodDurationMs: line.PeriodDurationMs}
-			if line.Limit > 0 {
-				remaining := line.Limit - line.Used
-				percentUsed := (line.Used / line.Limit) * 100
-				p.Remaining = &remaining
-				p.PercentUsed = &percentUsed
-			}
-			out.Progress = append(out.Progress, p)
-		case "text":
-			out.Texts = append(out.Texts, normalizedText{Label: line.Label, Value: line.Value, Subtitle: line.Subtitle})
-		case "badge":
-			out.Badges = append(out.Badges, normalizedBadge{Label: line.Label, Text: line.Text, Subtitle: line.Subtitle})
-		}
-	}
-	if len(out.Progress) > 0 {
-		primary := out.Progress[0]
-		out.PrimaryProgress = &primary
-	}
-	return out
-}
-
-func unitFor(format *lineFormat) string {
-	if format == nil {
-		return ""
-	}
-	switch format.Kind {
-	case "count":
-		return format.Suffix
-	case "dollars":
-		return "usd"
+func readNumberPtr(v any) *float64 {
+	switch n := v.(type) {
+	case float64:
+		value := n
+		return &value
+	case int:
+		value := float64(n)
+		return &value
+	case string:
+		return nil
 	default:
-		return format.Kind
+		return nil
 	}
 }
 
@@ -374,61 +376,95 @@ func (a app) printUsageHelp() {
 	fmt.Fprintf(a.stdout, "Flags:\n")
 	fmt.Fprintf(a.stdout, "  --agent    compact agent-friendly text\n")
 	fmt.Fprintf(a.stdout, "  --json     JSON envelope\n")
-	fmt.Fprintf(a.stdout, "  --base-url custom local API base URL\n")
-	fmt.Fprintf(a.stdout, "  --timeout  HTTP timeout\n")
 }
 
-func (a app) printHumanProviders(providers []normalizedSnapshot) {
+func (a app) printHumanProviders(providers []providerUsage) {
 	for i, provider := range providers {
 		if i > 0 {
 			fmt.Fprintln(a.stdout)
 		}
-		title := provider.DisplayName
-		if title == "" {
-			title = provider.ProviderID
-		}
-		fmt.Fprintf(a.stdout, "%s (%s)\n", title, provider.ProviderID)
+		title := strings.Title(provider.Provider)
+		fmt.Fprintf(a.stdout, "%s (%s)\n", title, provider.Provider)
 		if provider.Plan != "" {
 			fmt.Fprintf(a.stdout, "  plan      %s\n", provider.Plan)
 		}
-		for _, p := range provider.Progress {
-			fmt.Fprintf(a.stdout, "  %-9s %s %6s", strings.ToLower(p.Label), progressBar(p.PercentUsed), percentString(p.PercentUsed))
-			if p.Remaining != nil {
-				fmt.Fprintf(a.stdout, "  %.0f/%.0f %s", p.Used, p.Limit, unitLabel(p.Unit))
+		for _, q := range provider.Quotas {
+			fmt.Fprintf(a.stdout, "  %-9s %s %s left", q.Name, progressBar(q.LeftPct), percentString(q.LeftPct))
+			if q.Remaining != nil && q.Total != nil {
+				fmt.Fprintf(a.stdout, "  %.0f/%.0f", *q.Remaining, *q.Total)
 			}
-			if p.ResetsAt != "" {
-				fmt.Fprintf(a.stdout, "  · reset %s", shortTime(p.ResetsAt))
+			if q.UsedDollars != nil && q.LimitDollars != nil {
+				fmt.Fprintf(a.stdout, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
+			}
+			if q.ResetsAt != "" {
+				fmt.Fprintf(a.stdout, "  · reset %s", shortTime(q.ResetsAt))
 			}
 			fmt.Fprintln(a.stdout)
 		}
-		for _, text := range provider.Texts {
-			fmt.Fprintf(a.stdout, "  %-9s %s\n", strings.ToLower(text.Label), text.Value)
+		if provider.Credits != nil {
+			printCreditsHuman(a.stdout, provider.Provider, provider.Credits)
 		}
-		for _, badge := range provider.Badges {
-			fmt.Fprintf(a.stdout, "  %-9s %s\n", strings.ToLower(badge.Label), badge.Text)
+		if provider.ExtraUsage != nil {
+			printMapHuman(a.stdout, "extra", provider.ExtraUsage)
+		}
+		if provider.ExtraUsageBalance != nil {
+			printMapHuman(a.stdout, "extra", provider.ExtraUsageBalance)
 		}
 	}
 }
 
-func (a app) printAgentProvider(provider normalizedSnapshot) {
-	title := provider.ProviderID
-	if title == "" {
-		title = provider.DisplayName
-	}
-	parts := []string{title}
+func (a app) printAgentProvider(provider providerUsage) {
+	parts := []string{provider.Provider}
 	if provider.Plan != "" {
 		parts = append(parts, "plan="+provider.Plan)
 	}
-	for _, p := range provider.Progress {
-		parts = append(parts, fmt.Sprintf("%s=%s", slug(p.Label), percentString(p.PercentUsed)))
+	for _, q := range provider.Quotas {
+		if q.LeftPct != nil {
+			parts = append(parts, fmt.Sprintf("%s_left=%s", slug(q.Name), percentString(q.LeftPct)))
+		}
 	}
-	for _, t := range provider.Texts {
-		parts = append(parts, fmt.Sprintf("%s=%s", slug(t.Label), sanitizeInline(t.Value)))
-	}
-	for _, b := range provider.Badges {
-		parts = append(parts, fmt.Sprintf("%s=%s", slug(b.Label), sanitizeInline(b.Text)))
+	if provider.Credits != nil {
+		parts = append(parts, agentCredits(provider.Provider, provider.Credits)...)
 	}
 	fmt.Fprintln(a.stdout, strings.Join(parts, " | "))
+}
+
+func printCreditsHuman(w io.Writer, provider string, credits map[string]any) {
+	switch provider {
+	case "codex":
+		fmt.Fprintf(w, "  credits   %v left\n", credits["balance"])
+	case "cursor":
+		left, lok := credits["left_usd"]
+		total, tok := credits["total_usd"]
+		used, uok := credits["used_usd"]
+		if lok && tok && uok {
+			fmt.Fprintf(w, "  credits   $%v left  ($%v used / $%v total)\n", left, used, total)
+			return
+		}
+		fmt.Fprintf(w, "  credits   %v\n", credits)
+	default:
+		fmt.Fprintf(w, "  credits   %v\n", credits)
+	}
+}
+
+func agentCredits(provider string, credits map[string]any) []string {
+	switch provider {
+	case "codex":
+		return []string{fmt.Sprintf("credits_left=%v", credits["balance"])}
+	case "cursor":
+		return []string{fmt.Sprintf("credits_left_usd=%v", credits["left_usd"])}
+	default:
+		return []string{fmt.Sprintf("credits=%v", credits)}
+	}
+}
+
+func printMapHuman(w io.Writer, label string, values map[string]any) {
+	chunks := make([]string, 0, len(values))
+	for k, v := range values {
+		chunks = append(chunks, fmt.Sprintf("%s=%v", k, v))
+	}
+	sort.Strings(chunks)
+	fmt.Fprintf(w, "  %-9s %s\n", label, strings.Join(chunks, " "))
 }
 
 func progressBar(percent *float64) string {
@@ -441,9 +477,6 @@ func progressBar(percent *float64) string {
 	if filled > width {
 		filled = width
 	}
-	if filled < 0 {
-		filled = 0
-	}
 	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
 }
 
@@ -451,40 +484,25 @@ func percentString(percent *float64) string {
 	if percent == nil {
 		return "n/a"
 	}
-	return fmt.Sprintf("%5.1f%%", *percent)
+	return fmt.Sprintf("%.1f%%", *percent)
 }
 
 func shortTime(value string) string {
 	if value == "" {
 		return ""
 	}
-	if t, err := time.Parse(time.RFC3339, value); err == nil {
-		return t.UTC().Format("2006-01-02 15:04Z")
-	}
-	if t, err := time.Parse("2006-01-02T15:04:05.000Z", value); err == nil {
-		return t.UTC().Format("2006-01-02 15:04Z")
+	formats := []string{time.RFC3339, "2006-01-02T15:04:05.000Z"}
+	for _, format := range formats {
+		if t, err := time.Parse(format, value); err == nil {
+			return t.UTC().Format("2006-01-02 15:04Z")
+		}
 	}
 	return value
-}
-
-func unitLabel(unit string) string {
-	switch unit {
-	case "", "percent":
-		return ""
-	default:
-		return unit
-	}
 }
 
 func slug(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	value = strings.ReplaceAll(value, " ", "_")
-	return value
-}
-
-func sanitizeInline(value string) string {
-	value = strings.ReplaceAll(value, "\n", " ")
-	value = strings.TrimSpace(value)
 	return value
 }
 
