@@ -131,6 +131,7 @@ var (
 	cursorUsageURL       = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 	cursorPlanURL        = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
 	cursorCreditsURL     = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCreditGrantsBalance"
+	windsurfStatusURL    = "https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 	geminiLoadURL        = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	geminiQuotaURL       = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
 	geminiTokenURL       = "https://oauth2.googleapis.com/token"
@@ -373,6 +374,12 @@ func collectUsageHybrid(targets []string) ([]providerUsage, error) {
 			results = append(results, result)
 		case "cursor":
 			result, err := collectCursorUsage()
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+		case "windsurf":
+			result, err := collectWindsurfUsage()
 			if err != nil {
 				return nil, err
 			}
@@ -637,6 +644,117 @@ func decodeClaudeUsage(raw map[string]any) providerUsage {
 			"used_usd":  extra["used_credits"],
 			"limit_usd": extra["monthly_limit"],
 		}
+	}
+	return result
+}
+
+func collectWindsurfUsage() (providerUsage, error) {
+	apiKey, variant, err := readWindsurfAPIKey()
+	if err != nil {
+		return providerUsage{}, err
+	}
+	if apiKey == "" {
+		return providerUsage{Provider: "windsurf", OK: false, Error: "not installed or not logged in"}, nil
+	}
+	body, err := doWindsurfStatusRequest(apiKey, variant)
+	if err != nil {
+		return providerUsage{Provider: "windsurf", OK: false, Error: "api request failed"}, nil
+	}
+	return decodeWindsurfUsage(body), nil
+}
+
+func readWindsurfAPIKey() (string, string, error) {
+	candidates := []struct {
+		Variant string
+		DBPath  string
+	}{
+		{Variant: "windsurf", DBPath: filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Windsurf", "User", "globalStorage", "state.vscdb")},
+		{Variant: "windsurf-next", DBPath: filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Windsurf - Next", "User", "globalStorage", "state.vscdb")},
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate.DBPath); err != nil {
+			continue
+		}
+		authJSON, err := sqliteValue(candidate.DBPath, "SELECT value FROM ItemTable WHERE key='windsurfAuthStatus' LIMIT 1")
+		if err != nil || authJSON == "" {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(authJSON), &raw); err != nil {
+			continue
+		}
+		if key := stringField(raw, "apiKey"); key != "" {
+			return key, candidate.Variant, nil
+		}
+	}
+	return "", "", nil
+}
+
+func doWindsurfStatusRequest(apiKey, variant string) (map[string]any, error) {
+	payload := map[string]any{
+		"metadata": map[string]any{
+			"apiKey":           apiKey,
+			"ideName":          variant,
+			"ideVersion":       "1.108.2",
+			"extensionName":    variant,
+			"extensionVersion": "1.108.2",
+			"locale":           "en",
+		},
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, windsurfStatusURL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func decodeWindsurfUsage(raw map[string]any) providerUsage {
+	userStatus := nestedMap(raw, "userStatus")
+	planStatus := nestedMap(userStatus, "planStatus")
+	planInfo := nestedMap(planStatus, "planInfo")
+	result := providerUsage{Provider: "windsurf", OK: true, CheckedAt: time.Now().UTC().Format(time.RFC3339), Plan: strings.TrimSpace(stringField(planInfo, "planName"))}
+	for _, cfg := range []struct {
+		Remaining string
+		Reset     string
+		Name      string
+		Period    string
+	}{
+		{Remaining: "dailyQuotaRemainingPercent", Reset: "dailyQuotaResetAtUnix", Name: "daily", Period: "1d"},
+		{Remaining: "weeklyQuotaRemainingPercent", Reset: "weeklyQuotaResetAtUnix", Name: "weekly", Period: "7d"},
+	} {
+		rem, ok := numberValue(planStatus[cfg.Remaining])
+		if !ok {
+			continue
+		}
+		used := math.Round((100-rem)*10) / 10
+		left := math.Round(rem*10) / 10
+		q := quota{Name: cfg.Name, Period: cfg.Period, UsedPct: &used, LeftPct: &left}
+		if resetUnix, ok := numberValue(planStatus[cfg.Reset]); ok && resetUnix > 0 {
+			q.ResetsAt = time.Unix(int64(resetUnix), 0).UTC().Format(time.RFC3339)
+		}
+		result.Quotas = append(result.Quotas, q)
+	}
+	if overage, ok := numberValue(planStatus["overageBalanceMicros"]); ok && overage > 0 {
+		result.ExtraUsageBalance = map[string]any{"balance_usd": math.Round((overage/1e6)*100) / 100}
+	}
+	if len(result.Quotas) == 0 {
+		return providerUsage{Provider: "windsurf", OK: false, Error: "quota data unavailable"}
 	}
 	return result
 }

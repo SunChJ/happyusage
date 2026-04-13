@@ -130,6 +130,31 @@ func TestDecodeClaudeUsage(t *testing.T) {
 	}
 }
 
+func TestDecodeWindsurfUsage(t *testing.T) {
+	raw := map[string]any{
+		"userStatus": map[string]any{
+			"planStatus": map[string]any{
+				"planInfo": map[string]any{"planName": "Pro"},
+				"dailyQuotaRemainingPercent":  float64(80),
+				"dailyQuotaResetAtUnix":       float64(1893456000),
+				"weeklyQuotaRemainingPercent": float64(55),
+				"weeklyQuotaResetAtUnix":      float64(1894060800),
+				"overageBalanceMicros":        float64(1250000),
+			},
+		},
+	}
+	got := decodeWindsurfUsage(raw)
+	if !got.OK || got.Provider != "windsurf" || got.Plan != "Pro" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if len(got.Quotas) != 2 {
+		t.Fatalf("expected 2 quotas, got %+v", got.Quotas)
+	}
+	if got.ExtraUsageBalance == nil || got.ExtraUsageBalance["balance_usd"] != 1.25 {
+		t.Fatalf("unexpected extra balance: %+v", got.ExtraUsageBalance)
+	}
+}
+
 func TestDecodeCursorUsage(t *testing.T) {
 	usage := map[string]any{
 		"billingCycleEnd": float64(1893456000000),
