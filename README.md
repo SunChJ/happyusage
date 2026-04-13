@@ -9,19 +9,29 @@ The project is designed for two audiences:
 
 ## Install
 
-### macOS / Linux
+### Quick install (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+```
+
+Options:
+
+```bash
+# Install a specific version
+VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+
+# Custom install directory
+BIN_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+```
+
+### Go
 
 ```bash
 go install github.com/SunChJ/happyusage-cli/cmd/hu@latest
 ```
 
-### Windows
-
-```powershell
-go install github.com/SunChJ/happyusage-cli/cmd/hu@latest
-```
-
-### Local build
+### Build from source
 
 ```bash
 go build -o bin/hu ./cmd/hu
