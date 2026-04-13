@@ -42,7 +42,7 @@ func TestUsageListShowsConfiguredProviderIDs(t *testing.T) {
 }
 
 func TestUsageProviderAgentOutput(t *testing.T) {
-	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", LeftPct: numPtr(75)}, {Name: "weekly", LeftPct: numPtr(60)}}}}
+	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", LeftPct: numPtr(75), ResetsAt: "2099-01-01T12:00:00Z"}, {Name: "weekly", LeftPct: numPtr(60)}}}}
 	withMockCollector(results, nil, func() {
 		var stdout, stderr bytes.Buffer
 		exitCode := MainWithIO("hu", []string{"usage", "claude", "--agent"}, &stdout, &stderr)
@@ -50,7 +50,7 @@ func TestUsageProviderAgentOutput(t *testing.T) {
 			t.Fatalf("expected exit 0, got %d, stderr=%s", exitCode, stderr.String())
 		}
 		got := stdout.String()
-		if !strings.Contains(got, "claude") || !strings.Contains(got, "session_left=75.0%") {
+		if !strings.Contains(got, "claude") || !strings.Contains(got, "session_left=75.0%") || !strings.Contains(got, "session_reset_in=") || !strings.Contains(got, "session_reset_local=") {
 			t.Fatalf("unexpected agent output: %s", got)
 		}
 	})

@@ -397,7 +397,7 @@ func (a app) printHumanProviders(providers []providerUsage) {
 				fmt.Fprintf(a.stdout, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
 			}
 			if q.ResetsAt != "" {
-				fmt.Fprintf(a.stdout, "  · reset %s", shortTime(q.ResetsAt))
+				fmt.Fprintf(a.stdout, "  · %s", resetDisplay(q.ResetsAt))
 			}
 			fmt.Fprintln(a.stdout)
 		}
@@ -419,8 +419,15 @@ func (a app) printAgentProvider(provider providerUsage) {
 		parts = append(parts, "plan="+provider.Plan)
 	}
 	for _, q := range provider.Quotas {
+		name := slug(q.Name)
 		if q.LeftPct != nil {
-			parts = append(parts, fmt.Sprintf("%s_left=%s", slug(q.Name), percentString(q.LeftPct)))
+			parts = append(parts, fmt.Sprintf("%s_left=%s", name, percentString(q.LeftPct)))
+		}
+		if q.ResetsAt != "" {
+			if countdown, local := resetAgentFields(q.ResetsAt); countdown != "" {
+				parts = append(parts, fmt.Sprintf("%s_reset_in=%s", name, countdown))
+				parts = append(parts, fmt.Sprintf("%s_reset_local=%s", name, local))
+			}
 		}
 	}
 	if provider.Credits != nil {
@@ -488,16 +495,83 @@ func percentString(percent *float64) string {
 }
 
 func shortTime(value string) string {
-	if value == "" {
-		return ""
-	}
-	formats := []string{time.RFC3339, "2006-01-02T15:04:05.000Z"}
-	for _, format := range formats {
-		if t, err := time.Parse(format, value); err == nil {
-			return t.UTC().Format("2006-01-02 15:04Z")
-		}
+	if t, ok := parseResetTime(value); ok {
+		return t.Local().Format("2006-01-02 15:04")
 	}
 	return value
+}
+
+func parseResetTime(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	formats := []string{time.RFC3339, "2006-01-02T15:04:05.000Z", "2006-01-02"}
+	for _, format := range formats {
+		if t, err := time.Parse(format, value); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func resetDisplay(value string) string {
+	t, ok := parseResetTime(value)
+	if !ok {
+		return "reset " + value
+	}
+	countdown := humanDurationUntil(t)
+	local := t.Local().Format("2006-01-02 15:04")
+	return fmt.Sprintf("reset in %s (%s)", countdown, local)
+}
+
+func resetAgentFields(value string) (string, string) {
+	t, ok := parseResetTime(value)
+	if !ok {
+		return "", ""
+	}
+	return agentDurationUntil(t), t.Local().Format("2006-01-02_15:04")
+}
+
+func humanDurationUntil(t time.Time) string {
+	d := time.Until(t)
+	if d <= 0 {
+		return "0m"
+	}
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	if hours >= 24 {
+		days := hours / 24
+		hours = hours % 24
+		if hours == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return fmt.Sprintf("%dd %dh", days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
+}
+
+func agentDurationUntil(t time.Time) string {
+	d := time.Until(t)
+	if d <= 0 {
+		return "0m"
+	}
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	if hours >= 24 {
+		days := hours / 24
+		hours = hours % 24
+		if hours == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return fmt.Sprintf("%dd%dh", days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
 }
 
 func slug(value string) string {
