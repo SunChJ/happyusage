@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	happyusage "github.com/SunChJ/happyusage-cli"
+	happyusage "github.com/SunChJ/happyusage"
 )
 
 func main() {

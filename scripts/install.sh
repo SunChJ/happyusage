@@ -1,12 +1,12 @@
 #!/bin/sh
-# happyusage-cli installer
+# happyusage installer
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
 #   VERSION=v0.1.0 BIN_DIR=/usr/local/bin sh install.sh
 
 set -e
 
-REPO="SunChJ/happyusage-cli"
+REPO="SunChJ/happyusage"
 BIN_NAME="hu"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 VERSION="${VERSION:-}"

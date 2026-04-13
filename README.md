@@ -1,4 +1,4 @@
-# happyusage-cli
+# happyusage
 
 A tiny cross-platform CLI for checking local AI tool usage.
 
@@ -12,23 +12,23 @@ The project is designed for two audiences:
 ### Quick install (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
 ```
 
 Options:
 
 ```bash
 # Install a specific version
-VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
 
 # Custom install directory
-BIN_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage-cli/main/scripts/install.sh | sh
+BIN_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh | sh
 ```
 
 ### Go
 
 ```bash
-go install github.com/SunChJ/happyusage-cli/cmd/hu@latest
+go install github.com/SunChJ/happyusage/cmd/hu@latest
 ```
 
 ### Build from source

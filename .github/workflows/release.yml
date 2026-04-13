@@ -41,7 +41,7 @@ jobs:
           mkdir -p dist
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          go build -ldflags "-s -w -X github.com/SunChJ/happyusage-cli.Version=${GITHUB_REF_NAME}" \
+          go build -ldflags "-s -w -X github.com/SunChJ/happyusage.Version=${GITHUB_REF_NAME}" \
             -o "dist/hu${ext}" ./cmd/hu
       - name: Package
         run: |

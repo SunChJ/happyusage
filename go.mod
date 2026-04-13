@@ -1,3 +1,3 @@
-module github.com/SunChJ/happyusage-cli
+module github.com/SunChJ/happyusage
 
 go 1.26.0
