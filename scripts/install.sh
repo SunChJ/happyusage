@@ -12,10 +12,13 @@ BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 VERSION="${VERSION:-}"
 
 info() { printf "\033[1;34m==>\033[0m %s\n" "$1"; }
+warn() { printf "\033[1;33mwarning:\033[0m %s\n" "$1" >&2; }
 error() { printf "\033[1;31merror:\033[0m %s\n" "$1" >&2; exit 1; }
 
+DEFAULT_CURL="$(command -v curl 2>/dev/null || true)"
+
 resolve_curl() {
-  for candidate in "${HAPPYUSAGE_CURL:-}" /usr/local/opt/curl/bin/curl /usr/bin/curl "$(command -v curl 2>/dev/null || true)"; do
+  for candidate in "${HAPPYUSAGE_CURL:-}" /usr/local/opt/curl/bin/curl /usr/bin/curl "$DEFAULT_CURL"; do
     [ -n "$candidate" ] || continue
     [ -x "$candidate" ] || continue
     "$candidate" --version >/dev/null 2>&1 && {
@@ -27,6 +30,14 @@ resolve_curl() {
 }
 
 CURL_BIN="$(resolve_curl || true)"
+
+if [ -n "$DEFAULT_CURL" ] && [ -x "$DEFAULT_CURL" ] && ! "$DEFAULT_CURL" --version >/dev/null 2>&1; then
+  if [ -n "$CURL_BIN" ] && [ "$CURL_BIN" != "$DEFAULT_CURL" ]; then
+    warn "default curl is broken (${DEFAULT_CURL}); using ${CURL_BIN} instead"
+  else
+    warn "default curl is broken (${DEFAULT_CURL})"
+  fi
+fi
 
 detect_os() {
   case "$(uname -s)" in
