@@ -129,6 +129,33 @@ func TestDecodeClaudeUsage(t *testing.T) {
 	}
 }
 
+func TestDecodeCopilotUsage(t *testing.T) {
+	raw := map[string]any{
+		"copilot_plan": "business",
+		"quota_reset_date": "2030-02-01",
+		"limited_user_reset_date": "2030-02-01",
+		"quota_snapshots": map[string]any{
+			"premium_interactions": map[string]any{"percent_remaining": float64(72)},
+			"chat": map[string]any{"percent_remaining": float64(25)},
+		},
+		"limited_user_quotas": map[string]any{"chat": float64(30), "completions": float64(10)},
+		"monthly_quotas": map[string]any{"chat": float64(60), "completions": float64(40)},
+	}
+	got := decodeCopilotUsage(raw)
+	if !got.OK || got.Provider != "copilot" || got.Plan != "business" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if len(got.Quotas) != 4 {
+		t.Fatalf("expected 4 quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "premium" || got.Quotas[0].LeftPct == nil || *got.Quotas[0].LeftPct != 72 {
+		t.Fatalf("unexpected premium quota: %+v", got.Quotas[0])
+	}
+	if got.Quotas[2].Name != "chat" || got.Quotas[2].Remaining == nil || *got.Quotas[2].Remaining != 30 {
+		t.Fatalf("unexpected limited chat quota: %+v", got.Quotas[2])
+	}
+}
+
 func TestDecodeCodexUsage(t *testing.T) {
 	raw := map[string]any{
 		"plan_type": "plus",

@@ -351,6 +351,12 @@ func collectUsageHybrid(targets []string) ([]providerUsage, error) {
 				return nil, err
 			}
 			results = append(results, result)
+		case "copilot":
+			result, err := collectCopilotUsage()
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
 		default:
 			scriptTargets = append(scriptTargets, target)
 		}
@@ -612,6 +618,118 @@ func decodeClaudeUsage(raw map[string]any) providerUsage {
 			"limit_usd": extra["monthly_limit"],
 		}
 	}
+	return result
+}
+
+func collectCopilotUsage() (providerUsage, error) {
+	token, err := readCopilotToken()
+	if err != nil {
+		return providerUsage{}, err
+	}
+	if token == "" {
+		return providerUsage{Provider: "copilot", OK: false, Error: "not logged in, run 'gh auth login'"}, nil
+	}
+
+	raw, err := doCopilotUsageRequest(token)
+	if err != nil {
+		return providerUsage{Provider: "copilot", OK: false, Error: err.Error()}, nil
+	}
+	return decodeCopilotUsage(raw), nil
+}
+
+func readCopilotToken() (string, error) {
+	cmd := exec.Command("gh", "auth", "token")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func doCopilotUsageRequest(token string) (map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/copilot_internal/user", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("X-Github-Api-Version", "2025-04-01")
+	req.Header.Set("Editor-Version", "vscode/1.96.2")
+	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.26.7")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("api failed, token may be expired")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse failed: %w", err)
+	}
+	return raw, nil
+}
+
+func decodeCopilotUsage(raw map[string]any) providerUsage {
+	result := providerUsage{
+		Provider:  "copilot",
+		OK:        true,
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		Plan:      stringField(raw, "copilot_plan"),
+	}
+
+	snaps := nestedMap(raw, "quota_snapshots")
+	resetDate := stringField(raw, "quota_reset_date")
+	for _, cfg := range []struct {
+		Key  string
+		Name string
+	}{
+		{Key: "premium_interactions", Name: "premium"},
+		{Key: "chat", Name: "chat"},
+	} {
+		snap := nestedMap(snaps, cfg.Key)
+		rem, ok := numberValue(snap["percent_remaining"])
+		if !ok {
+			continue
+		}
+		used := math.Round((100-rem)*10) / 10
+		left := math.Round(rem*10) / 10
+		q := quota{Name: cfg.Name, Period: "monthly", UsedPct: &used, LeftPct: &left}
+		if resetDate != "" {
+			q.ResetsAt = resetDate
+		}
+		result.Quotas = append(result.Quotas, q)
+	}
+
+	limited := nestedMap(raw, "limited_user_quotas")
+	monthly := nestedMap(raw, "monthly_quotas")
+	limitedReset := stringField(raw, "limited_user_reset_date")
+	for _, cfg := range []struct {
+		Key  string
+		Name string
+	}{
+		{Key: "chat", Name: "chat"},
+		{Key: "completions", Name: "completions"},
+	} {
+		remaining, rok := numberValue(limited[cfg.Key])
+		total, tok := numberValue(monthly[cfg.Key])
+		if !rok || !tok || total <= 0 {
+			continue
+		}
+		usedPct := math.Round((1-remaining/total)*1000) / 10
+		leftPct := math.Round((100-usedPct)*10) / 10
+		q := quota{Name: cfg.Name, Period: "monthly", UsedPct: &usedPct, LeftPct: &leftPct, Remaining: &remaining, Total: &total}
+		if limitedReset != "" {
+			q.ResetsAt = limitedReset
+		}
+		result.Quotas = append(result.Quotas, q)
+	}
+
 	return result
 }
 
