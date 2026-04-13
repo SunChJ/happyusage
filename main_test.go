@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func withMockCollector(results []providerUsage, err error, fn func()) {
@@ -126,6 +127,38 @@ func TestDecodeClaudeUsage(t *testing.T) {
 	}
 	if got.ExtraUsage == nil || got.ExtraUsage["enabled"] != true {
 		t.Fatalf("unexpected extra usage: %+v", got.ExtraUsage)
+	}
+}
+
+func TestDecodeGeminiUsage(t *testing.T) {
+	loadBody := map[string]any{"subscriptionTier": "standard-tier", "nested": map[string]any{"cloudaicompanionProject": "p1"}}
+	quotaBody := map[string]any{
+		"buckets": []any{
+			map[string]any{"modelId": "gemini-pro", "remainingFraction": float64(0.4), "resetTime": "2030-01-01T00:00:00Z"},
+			map[string]any{"modelId": "gemini-2.0-flash", "remainingFraction": float64(0.7), "resetTime": "2030-01-02T00:00:00Z"},
+			map[string]any{"modelId": "gemini-pro", "remainingFraction": float64(0.2), "resetTime": "2030-01-03T00:00:00Z"},
+		},
+	}
+	got := decodeGeminiUsage(loadBody, quotaBody)
+	if !got.OK || got.Provider != "gemini" || got.Plan != "Paid" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if len(got.Quotas) != 2 {
+		t.Fatalf("expected 2 quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "pro" || got.Quotas[0].LeftPct == nil || *got.Quotas[0].LeftPct != 20 {
+		t.Fatalf("unexpected pro quota: %+v", got.Quotas[0])
+	}
+}
+
+func TestGeminiTokenNeedsRefresh(t *testing.T) {
+	soon := float64(time.Now().Add(2 * time.Minute).UnixMilli())
+	later := float64(time.Now().Add(10 * time.Minute).UnixMilli())
+	if !geminiTokenNeedsRefresh(map[string]any{"expiry_date": soon}) {
+		t.Fatal("expected near expiry token to need refresh")
+	}
+	if geminiTokenNeedsRefresh(map[string]any{"expiry_date": later}) {
+		t.Fatal("expected later expiry token to skip refresh")
 	}
 }
 
