@@ -1678,7 +1678,7 @@ func (a app) printHumanProviders(providers []providerUsage) {
 			fmt.Fprintf(a.stdout, "  plan      %s\n", provider.Plan)
 		}
 		for _, q := range provider.Quotas {
-			fmt.Fprintf(a.stdout, "  %-9s %s %s left", q.Name, progressBar(q.LeftPct), percentString(q.LeftPct))
+			fmt.Fprintf(a.stdout, "  %-9s %s %s left", q.Name, progressBar(q.UsedPct), percentString(q.LeftPct))
 			if q.Remaining != nil && q.Total != nil {
 				fmt.Fprintf(a.stdout, "  %.0f/%.0f", *q.Remaining, *q.Total)
 			}
@@ -1763,17 +1763,28 @@ func printMapHuman(w io.Writer, label string, values map[string]any) {
 	fmt.Fprintf(w, "  %-9s %s\n", label, strings.Join(chunks, " "))
 }
 
-func progressBar(percent *float64) string {
+func progressBar(usedPercent *float64) string {
 	const width = 16
-	if percent == nil {
+	if usedPercent == nil {
 		return "[????????????????]"
 	}
-	p := math.Max(0, math.Min(100, *percent))
+	p := math.Max(0, math.Min(100, *usedPercent))
 	filled := int(math.Round((p / 100) * width))
 	if filled > width {
 		filled = width
 	}
-	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+	var colorCode string
+	switch {
+	case p >= 80:
+		colorCode = "\033[31m" // red
+	case p >= 50:
+		colorCode = "\033[33m" // yellow
+	default:
+		colorCode = "\033[32m" // green
+	}
+	const reset = "\033[0m"
+	blocks := colorCode + strings.Repeat("█", filled) + reset + strings.Repeat("░", width-filled)
+	return "[" + blocks + "]"
 }
 
 func percentString(percent *float64) string {
