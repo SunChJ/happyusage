@@ -11,6 +11,7 @@ Check your AI provider usage from the terminal. Built for humans and agents.
 > # query usage
 > hu usage --agent                 # all providers, compact text
 > hu usage <provider> --agent      # single provider
+> hu usage --status                # keep dashboard visible and auto-refresh
 > hu usage list                    # discover available provider IDs
 > ```
 
@@ -52,6 +53,7 @@ hu update
 hu usage                        # all providers, human-friendly
 hu usage <provider>              # single provider
 hu usage list                    # list available provider IDs
+hu usage [provider] --status     # keep usage visible and refresh every 30s
 hu usage [provider] --agent      # compact text for AI agents (recommended for agent use)
 hu usage [provider] --json       # structured JSON for web UI / integrations / debugging
 ```

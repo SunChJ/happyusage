@@ -13,6 +13,22 @@ import (
 	"time"
 )
 
+func TestParseUsageArgsStatus(t *testing.T) {
+	opts, err := parseUsageArgs([]string{"claude", "--status"})
+	if err != nil {
+		t.Fatalf("parseUsageArgs returned error: %v", err)
+	}
+	if !opts.Status || opts.Target != "claude" || opts.Action != "provider" {
+		t.Fatalf("unexpected opts: %+v", opts)
+	}
+}
+
+func TestParseUsageArgsRejectsStatusWithAgent(t *testing.T) {
+	if _, err := parseUsageArgs([]string{"--status", "--agent"}); err == nil {
+		t.Fatal("expected parseUsageArgs to reject --status with --agent")
+	}
+}
+
 func withMockCollector(results []providerUsage, err error, fn func()) {
 	old := collectUsageFn
 	collectUsageFn = func(targets []string) ([]providerUsage, error) {
@@ -78,6 +94,26 @@ func TestUsageProviderJSONOutput(t *testing.T) {
 	})
 }
 
+func TestRunUsageStatusLoopRendersFrame(t *testing.T) {
+	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", UsedPct: numPtr(25), LeftPct: numPtr(75)}}}}
+	withMockCollector(results, nil, func() {
+		var stdout, stderr bytes.Buffer
+		a := app{progName: "hu", stdout: &stdout, stderr: &stderr}
+		interrupts := make(chan os.Signal, 1)
+		interrupts <- os.Interrupt
+
+		exitCode := a.runUsageStatusLoop(usageOptions{Status: true, Action: "all"}, make(chan time.Time), interrupts)
+		if exitCode != 0 {
+			t.Fatalf("expected exit 0, got %d, stderr=%s", exitCode, stderr.String())
+		}
+
+		got := stdout.String()
+		if !strings.Contains(got, "\033[H\033[2J") || !strings.Contains(got, "happyusage status | refresh 30s") || !strings.Contains(got, "Claude (claude)") {
+			t.Fatalf("unexpected status output: %q", got)
+		}
+	})
+}
+
 func TestIsNewerVersion(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -111,8 +147,8 @@ func TestExtractClaudeAccessToken(t *testing.T) {
 
 func TestDecodeClaudeUsage(t *testing.T) {
 	raw := map[string]any{
-		"five_hour": map[string]any{"utilization": float64(33), "resets_at": "2030-01-01T00:00:00Z"},
-		"seven_day": map[string]any{"utilization": float64(55), "resets_at": "2030-01-02T00:00:00Z"},
+		"five_hour":   map[string]any{"utilization": float64(33), "resets_at": "2030-01-01T00:00:00Z"},
+		"seven_day":   map[string]any{"utilization": float64(55), "resets_at": "2030-01-02T00:00:00Z"},
 		"extra_usage": map[string]any{"is_enabled": true, "used_credits": float64(12.5), "monthly_limit": float64(50)},
 	}
 	got := decodeClaudeUsage(raw)
@@ -134,7 +170,7 @@ func TestDecodeWindsurfUsage(t *testing.T) {
 	raw := map[string]any{
 		"userStatus": map[string]any{
 			"planStatus": map[string]any{
-				"planInfo": map[string]any{"planName": "Pro"},
+				"planInfo":                    map[string]any{"planName": "Pro"},
 				"dailyQuotaRemainingPercent":  float64(80),
 				"dailyQuotaResetAtUnix":       float64(1893456000),
 				"weeklyQuotaRemainingPercent": float64(55),
@@ -212,15 +248,15 @@ func TestGeminiTokenNeedsRefresh(t *testing.T) {
 
 func TestDecodeCopilotUsage(t *testing.T) {
 	raw := map[string]any{
-		"copilot_plan": "business",
-		"quota_reset_date": "2030-02-01",
+		"copilot_plan":            "business",
+		"quota_reset_date":        "2030-02-01",
 		"limited_user_reset_date": "2030-02-01",
 		"quota_snapshots": map[string]any{
 			"premium_interactions": map[string]any{"percent_remaining": float64(72)},
-			"chat": map[string]any{"percent_remaining": float64(25)},
+			"chat":                 map[string]any{"percent_remaining": float64(25)},
 		},
 		"limited_user_quotas": map[string]any{"chat": float64(30), "completions": float64(10)},
-		"monthly_quotas": map[string]any{"chat": float64(60), "completions": float64(40)},
+		"monthly_quotas":      map[string]any{"chat": float64(60), "completions": float64(40)},
 	}
 	got := decodeCopilotUsage(raw)
 	if !got.OK || got.Provider != "copilot" || got.Plan != "business" {
@@ -240,9 +276,9 @@ func TestDecodeCopilotUsage(t *testing.T) {
 func TestDecodeCodexUsage(t *testing.T) {
 	raw := map[string]any{
 		"plan_type": "plus",
-		"credits": map[string]any{"balance": float64(3)},
+		"credits":   map[string]any{"balance": float64(3)},
 		"rate_limit": map[string]any{
-			"primary_window": map[string]any{"used_percent": float64(25), "reset_at": float64(1893456000)},
+			"primary_window":   map[string]any{"used_percent": float64(25), "reset_at": float64(1893456000)},
 			"secondary_window": map[string]any{"used_percent": float64(55), "reset_at": "2030-01-01T00:00:00Z"},
 		},
 	}
@@ -298,9 +334,9 @@ func TestCollectCodexUsageRefreshesToken(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"plan_type": "plus",
-				"credits": map[string]any{"balance": float64(0)},
+				"credits":   map[string]any{"balance": float64(0)},
 				"rate_limit": map[string]any{
-					"primary_window": map[string]any{"used_percent": float64(47), "reset_at": "2030-01-01T00:00:00Z"},
+					"primary_window":   map[string]any{"used_percent": float64(47), "reset_at": "2030-01-01T00:00:00Z"},
 					"secondary_window": map[string]any{"used_percent": float64(58), "reset_at": "2030-01-02T00:00:00Z"},
 				},
 			})

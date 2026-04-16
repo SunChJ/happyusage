@@ -1,6 +1,7 @@
 package happyusage
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -68,9 +70,9 @@ type app struct {
 }
 
 type spinner struct {
-	w      io.Writer
-	stop   chan struct{}
-	done   chan struct{}
+	w    io.Writer
+	stop chan struct{}
+	done chan struct{}
 }
 
 func newSpinner(w io.Writer) *spinner {
@@ -105,6 +107,7 @@ func (s *spinner) Stop() {
 type usageOptions struct {
 	JSON   bool
 	Agent  bool
+	Status bool
 	Target string
 	Action string
 }
@@ -122,24 +125,25 @@ type codexAuthFile struct {
 }
 
 var (
-	collectUsageFn       = collectUsageHybrid
-	claudeUsageURL       = "https://api.anthropic.com/api/oauth/usage"
-	claudeKeychainSvc    = "Claude Code-credentials"
-	claudeBetaHeader     = "oauth-2025-04-20"
-	cursorTokenURL       = "https://api2.cursor.sh/oauth/token"
-	cursorClientID       = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
-	cursorUsageURL       = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
-	cursorPlanURL        = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
-	cursorCreditsURL     = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCreditGrantsBalance"
-	windsurfStatusURL    = "https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
-	geminiLoadURL        = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-	geminiQuotaURL       = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
-	geminiTokenURL       = "https://oauth2.googleapis.com/token"
-	codexUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
-	codexTokenURL        = "https://auth.openai.com/oauth/token"
-	codexOAuthClientID   = "app_EMoamEEZ73f0CkXaXp7hrann"
-	httpClient           = &http.Client{Timeout: 15 * time.Second}
-	allProviders         = []string{"claude", "codex", "cursor", "copilot", "gemini", "windsurf"}
+	collectUsageFn        = collectUsageHybrid
+	claudeUsageURL        = "https://api.anthropic.com/api/oauth/usage"
+	claudeKeychainSvc     = "Claude Code-credentials"
+	claudeBetaHeader      = "oauth-2025-04-20"
+	cursorTokenURL        = "https://api2.cursor.sh/oauth/token"
+	cursorClientID        = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
+	cursorUsageURL        = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+	cursorPlanURL         = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
+	cursorCreditsURL      = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCreditGrantsBalance"
+	windsurfStatusURL     = "https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
+	geminiLoadURL         = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	geminiQuotaURL        = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+	geminiTokenURL        = "https://oauth2.googleapis.com/token"
+	codexUsageURL         = "https://chatgpt.com/backend-api/wham/usage"
+	codexTokenURL         = "https://auth.openai.com/oauth/token"
+	codexOAuthClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+	httpClient            = &http.Client{Timeout: 15 * time.Second}
+	allProviders          = []string{"claude", "codex", "cursor", "copilot", "gemini", "windsurf"}
+	statusRefreshInterval = 30 * time.Second
 )
 
 func Main(progName string, args []string) int {
@@ -197,7 +201,7 @@ func (a app) run(args []string) int {
 
 func isQuietMode(args []string) bool {
 	for _, arg := range args {
-		if arg == "--agent" || arg == "--json" || arg == "update" {
+		if arg == "--agent" || arg == "--json" || arg == "--status" || arg == "update" {
 			return true
 		}
 	}
@@ -209,6 +213,7 @@ func parseUsageArgs(args []string) (usageOptions, error) {
 	fs.SetOutput(io.Discard)
 	jsonOut := fs.Bool("json", false, "emit JSON envelope")
 	agentOut := fs.Bool("agent", false, "emit compact agent-friendly text")
+	statusOut := fs.Bool("status", false, "keep usage visible and refresh continuously")
 
 	flagArgs := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
@@ -223,7 +228,10 @@ func parseUsageArgs(args []string) (usageOptions, error) {
 		return usageOptions{}, err
 	}
 
-	opts := usageOptions{JSON: *jsonOut, Agent: *agentOut, Action: "all"}
+	opts := usageOptions{JSON: *jsonOut, Agent: *agentOut, Status: *statusOut, Action: "all"}
+	if opts.Status && (opts.JSON || opts.Agent) {
+		return usageOptions{}, errors.New("--status cannot be used with --agent or --json")
+	}
 	if len(positionals) > 0 {
 		if positionals[0] == "list" {
 			opts.Action = "list"
@@ -244,6 +252,13 @@ func (a app) showSpinner(opts usageOptions) func() {
 }
 
 func (a app) runUsage(opts usageOptions) int {
+	if opts.Status {
+		if opts.Action == "list" {
+			return a.exitErr(errors.New("--status cannot be used with usage list"))
+		}
+		return a.runUsageStatus(opts)
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	switch opts.Action {
@@ -311,6 +326,70 @@ func (a app) runUsage(opts usageOptions) int {
 		a.printHumanProviders(configured)
 		return 0
 	}
+}
+
+func (a app) runUsageStatus(opts usageOptions) int {
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+
+	ticker := time.NewTicker(statusRefreshInterval)
+	defer ticker.Stop()
+
+	return a.runUsageStatusLoop(opts, ticker.C, interrupts)
+}
+
+func (a app) runUsageStatusLoop(opts usageOptions, ticks <-chan time.Time, interrupts <-chan os.Signal) int {
+	for {
+		exitCode := a.renderUsageStatusFrame(opts)
+		if exitCode != 0 {
+			return exitCode
+		}
+
+		select {
+		case <-interrupts:
+			return 0
+		case <-ticks:
+		}
+	}
+}
+
+func (a app) renderUsageStatusFrame(opts usageOptions) int {
+	var (
+		results []providerUsage
+		err     error
+	)
+
+	switch opts.Action {
+	case "provider":
+		results, err = collectUsageFn([]string{opts.Target})
+		if err != nil {
+			return a.exitErr(err)
+		}
+		if len(results) == 0 {
+			return a.exitErr(fmt.Errorf("provider not found: %s", opts.Target))
+		}
+		if !results[0].OK {
+			return a.exitErr(fmt.Errorf("%s: %s", results[0].Provider, results[0].Error))
+		}
+	case "all":
+		results, err = collectUsageFn(nil)
+		if err != nil {
+			return a.exitErr(err)
+		}
+		results = configuredProviders(results)
+	default:
+		return a.exitErr(fmt.Errorf("unsupported status action: %s", opts.Action))
+	}
+
+	var body bytes.Buffer
+	renderer := app{progName: a.progName, stdout: &body, stderr: a.stderr}
+	fmt.Fprintf(&body, "happyusage status | refresh %s | updated %s\n\n", statusRefreshInterval.Truncate(time.Second), time.Now().Local().Format("2006-01-02 15:04:05"))
+	renderer.printHumanProviders(results)
+
+	fmt.Fprint(a.stdout, "\033[H\033[2J")
+	_, _ = io.Copy(a.stdout, &body)
+	return 0
 }
 
 func configuredProviders(results []providerUsage) []providerUsage {
@@ -1641,13 +1720,14 @@ func numberString(v any) string {
 func (a app) printHelp() {
 	fmt.Fprintf(a.stdout, "hu (happyusage) — check your AI provider usage, worry less\n\n")
 	fmt.Fprintf(a.stdout, "Usage:\n")
-	fmt.Fprintf(a.stdout, "  %s usage [provider] [--agent|--json]\n\n", a.progName)
+	fmt.Fprintf(a.stdout, "  %s usage [provider] [--agent|--json|--status]\n\n", a.progName)
 	fmt.Fprintf(a.stdout, "Examples:\n")
 	fmt.Fprintf(a.stdout, "  %s usage                        show all providers\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage claude                  show a single provider\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage list                    list available provider IDs\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage --agent                 compact text for AI agents\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage --json                  structured JSON for web UI\n", a.progName)
+	fmt.Fprintf(a.stdout, "  %s usage --status                keep usage visible and auto-refresh\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage claude --agent          single provider, agent format\n\n", a.progName)
 	fmt.Fprintf(a.stdout, "Other:\n")
 	fmt.Fprintf(a.stdout, "  %s update                        update to latest version\n", a.progName)
@@ -1665,6 +1745,7 @@ func (a app) printUsageHelp() {
 	fmt.Fprintf(a.stdout, "Flags:\n")
 	fmt.Fprintf(a.stdout, "  --agent    compact text for AI agents\n")
 	fmt.Fprintf(a.stdout, "  --json     structured JSON for web UI\n")
+	fmt.Fprintf(a.stdout, "  --status   keep usage visible and refresh every 30s\n")
 }
 
 func (a app) printHumanProviders(providers []providerUsage) {
