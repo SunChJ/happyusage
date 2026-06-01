@@ -3,6 +3,7 @@ package happyusage
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -145,24 +146,35 @@ func TestExtractClaudeAccessToken(t *testing.T) {
 	}
 }
 
+func TestExtractClaudeAccessTokenFromHexPayload(t *testing.T) {
+	raw := hex.EncodeToString([]byte(`{"claudeAiOauth":{"accessToken":"claude-token"}}`))
+	if got := extractClaudeAccessToken(raw); got != "claude-token" {
+		t.Fatalf("unexpected token: %q", got)
+	}
+}
+
 func TestDecodeClaudeUsage(t *testing.T) {
 	raw := map[string]any{
-		"five_hour":   map[string]any{"utilization": float64(33), "resets_at": "2030-01-01T00:00:00Z"},
-		"seven_day":   map[string]any{"utilization": float64(55), "resets_at": "2030-01-02T00:00:00Z"},
-		"extra_usage": map[string]any{"is_enabled": true, "used_credits": float64(12.5), "monthly_limit": float64(50)},
+		"five_hour":          map[string]any{"utilization": float64(33), "resets_at": "2030-01-01T00:00:00Z"},
+		"seven_day":          map[string]any{"utilization": float64(55), "resets_at": "2030-01-02T00:00:00Z"},
+		"seven_day_omelette": map[string]any{"utilization": float64(12), "resets_at": "2030-01-03T00:00:00Z"},
+		"extra_usage":        map[string]any{"is_enabled": true, "used_credits": float64(12.5), "monthly_limit": float64(50)},
 	}
 	got := decodeClaudeUsage(raw)
 	if !got.OK || got.Provider != "claude" {
 		t.Fatalf("unexpected result: %+v", got)
 	}
-	if len(got.Quotas) != 2 {
-		t.Fatalf("expected 2 quotas, got %+v", got.Quotas)
+	if len(got.Quotas) != 3 {
+		t.Fatalf("expected 3 quotas, got %+v", got.Quotas)
 	}
 	if got.Quotas[0].Name != "session" || got.Quotas[0].LeftPct == nil || *got.Quotas[0].LeftPct != 67 {
 		t.Fatalf("unexpected session quota: %+v", got.Quotas[0])
 	}
 	if got.ExtraUsage == nil || got.ExtraUsage["enabled"] != true {
 		t.Fatalf("unexpected extra usage: %+v", got.ExtraUsage)
+	}
+	if got.Quotas[2].Name != "design_weekly" {
+		t.Fatalf("unexpected design quota: %+v", got.Quotas[2])
 	}
 }
 
@@ -301,6 +313,67 @@ func TestDecodeCodexUsage(t *testing.T) {
 	}
 }
 
+func TestDecodeCodexUsageUsesHeadersAndReviewLimit(t *testing.T) {
+	raw := map[string]any{
+		"plan_type": "pro",
+		"credits":   map[string]any{"has_credits": false},
+		"rate_limit": map[string]any{
+			"primary_window":   map[string]any{"reset_after_seconds": float64(60)},
+			"secondary_window": map[string]any{"used_percent": float64(40)},
+		},
+		"code_review_rate_limit": map[string]any{
+			"primary_window": map[string]any{"used_percent": float64(20), "reset_at": float64(1893456000)},
+		},
+		"additional_rate_limits": []any{
+			map[string]any{
+				"limit_name": "GPT-5.1-Codex-Thinking",
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{"used_percent": float64(10)},
+				},
+			},
+		},
+	}
+	headers := http.Header{}
+	headers.Set("X-Codex-Primary-Used-Percent", "15")
+	headers.Set("X-Codex-Credits-Balance", "42")
+
+	got := decodeCodexUsageWithHeaders(raw, headers)
+	if got.Plan != "Pro 20x" {
+		t.Fatalf("unexpected plan: %s", got.Plan)
+	}
+	if got.Credits["balance"] != "0" {
+		t.Fatalf("expected zero-credit body to win, got %+v", got.Credits)
+	}
+	if len(got.Quotas) != 4 {
+		t.Fatalf("expected 4 quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "session" || got.Quotas[0].UsedPct == nil || *got.Quotas[0].UsedPct != 15 {
+		t.Fatalf("unexpected session quota: %+v", got.Quotas[0])
+	}
+	if got.Quotas[2].Name != "Thinking" {
+		t.Fatalf("expected shortened additional limit name, got %+v", got.Quotas[2])
+	}
+	if got.Quotas[3].Name != "reviews" {
+		t.Fatalf("expected reviews quota, got %+v", got.Quotas[3])
+	}
+}
+
+func TestReadCodexAuthFileSupportsHexPayload(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "auth.json")
+	raw := hex.EncodeToString([]byte(`{"tokens":{"access_token":"access","refresh_token":"refresh"}}`))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := readCodexAuthFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.Tokens.AccessToken != "access" || auth.Tokens.RefreshToken != "refresh" {
+		t.Fatalf("unexpected auth: %+v", auth)
+	}
+}
+
 func TestCollectCodexUsageRefreshesToken(t *testing.T) {
 	oldClient := httpClient
 	oldUsageURL := codexUsageURL
@@ -366,6 +439,7 @@ func TestCollectCodexUsageRefreshesToken(t *testing.T) {
 	auth := codexAuthFile{}
 	auth.Tokens.AccessToken = "old-token"
 	auth.Tokens.RefreshToken = "refresh-1"
+	auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
 	if err := writeCodexAuthFile(filepath.Join(tmp, "auth.json"), auth); err != nil {
 		t.Fatal(err)
 	}

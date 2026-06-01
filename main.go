@@ -2,8 +2,10 @@ package happyusage
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -134,6 +136,10 @@ var (
 	cursorUsageURL        = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 	cursorPlanURL         = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
 	cursorCreditsURL      = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCreditGrantsBalance"
+	cursorRESTUsageURL    = "https://cursor.com/api/usage"
+	cursorStripeURL       = "https://cursor.com/api/auth/stripe"
+	cursorKeychainAccess  = "cursor-access-token"
+	cursorKeychainRefresh = "cursor-refresh-token"
 	windsurfStatusURL     = "https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 	geminiLoadURL         = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	geminiQuotaURL        = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
@@ -141,6 +147,7 @@ var (
 	codexUsageURL         = "https://chatgpt.com/backend-api/wham/usage"
 	codexTokenURL         = "https://auth.openai.com/oauth/token"
 	codexOAuthClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexKeychainSvc      = "Codex Auth"
 	httpClient            = &http.Client{Timeout: 15 * time.Second}
 	allProviders          = []string{"claude", "codex", "cursor", "copilot", "gemini", "windsurf"}
 	statusRefreshInterval = 30 * time.Second
@@ -611,6 +618,48 @@ func readNumberPtr(v any) *float64 {
 	}
 }
 
+func parseJSONOrHex[T any](raw string, out *T) error {
+	text := strings.TrimSpace(raw)
+	if err := json.Unmarshal([]byte(text), out); err == nil {
+		return nil
+	}
+	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
+		text = text[2:]
+	}
+	if text == "" || len(text)%2 != 0 {
+		return errors.New("invalid json")
+	}
+	for _, r := range text {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return errors.New("invalid json")
+		}
+	}
+	decoded, err := hex.DecodeString(text)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(decoded, out)
+}
+
+func readKeychainPassword(service string) (string, bool) {
+	cmd := exec.Command("security", "find-generic-password", "-s", service, "-w")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	text := strings.TrimSpace(string(out))
+	return text, text != ""
+}
+
+func writeKeychainPassword(service, value string) bool {
+	account := os.Getenv("USER")
+	if account == "" {
+		account = service
+	}
+	cmd := exec.Command("security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", value)
+	return cmd.Run() == nil
+}
+
 func collectClaudeUsage() (providerUsage, error) {
 	raw, err := readClaudeCredentials()
 	if err != nil {
@@ -633,12 +682,12 @@ func collectClaudeUsage() (providerUsage, error) {
 }
 
 func readClaudeCredentials() (string, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", claudeKeychainSvc, "-w")
-	out, err := cmd.Output()
-	if err == nil {
-		return strings.TrimSpace(string(out)), nil
+	for _, service := range claudeKeychainServiceCandidates() {
+		if raw, ok := readKeychainPassword(service); ok && extractClaudeAccessToken(raw) != "" {
+			return raw, nil
+		}
 	}
-	credPath := filepath.Join(os.Getenv("HOME"), ".claude", ".credentials.json")
+	credPath := filepath.Join(claudeConfigDir(), ".credentials.json")
 	data, readErr := os.ReadFile(credPath)
 	if readErr == nil {
 		return string(data), nil
@@ -649,9 +698,25 @@ func readClaudeCredentials() (string, error) {
 	return "", readErr
 }
 
+func claudeConfigDir() string {
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.Getenv("HOME"), ".claude")
+}
+
+func claudeKeychainServiceCandidates() []string {
+	base := claudeKeychainSvc
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		sum := sha256.Sum256([]byte(dir))
+		return []string{fmt.Sprintf("%s-%x", base, sum[:4]), base}
+	}
+	return []string{base}
+}
+
 func extractClaudeAccessToken(raw string) string {
 	var parsed map[string]any
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+	if err := parseJSONOrHex(raw, &parsed); err != nil {
 		return ""
 	}
 	oauth, _ := parsed["claudeAiOauth"].(map[string]any)
@@ -668,7 +733,10 @@ func doClaudeUsageRequest(token string) (map[string]any, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", claudeBetaHeader)
+	req.Header.Set("User-Agent", "claude-code/2.1.69")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -677,6 +745,12 @@ func doClaudeUsageRequest(token string) (map[string]any, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if retry := retryAfterDisplay(resp.Header); retry != "" {
+			return nil, fmt.Errorf("rate limited, retry in ~%s", retry)
+		}
+		return nil, errors.New("rate limited, try again later")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, errors.New("api failed, token may be expired")
@@ -703,6 +777,7 @@ func decodeClaudeUsage(raw map[string]any) providerUsage {
 		{Key: "seven_day", Name: "weekly", Period: "7d"},
 		{Key: "seven_day_sonnet", Name: "sonnet_weekly", Period: "7d"},
 		{Key: "seven_day_opus", Name: "opus_weekly", Period: "7d"},
+		{Key: "seven_day_omelette", Name: "design_weekly", Period: "7d"},
 	} {
 		window := nestedMap(raw, cfg.Key)
 		used, ok := numberValue(window["utilization"])
@@ -737,7 +812,7 @@ func collectWindsurfUsage() (providerUsage, error) {
 	}
 	body, err := doWindsurfStatusRequest(apiKey, variant)
 	if err != nil {
-		return providerUsage{Provider: "windsurf", OK: false, Error: "api request failed"}, nil
+		return providerUsage{Provider: "windsurf", OK: false, Error: err.Error()}, nil
 	}
 	return decodeWindsurfUsage(body), nil
 }
@@ -796,6 +871,12 @@ func doWindsurfStatusRequest(apiKey, variant string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, errors.New("not logged in")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("api request failed with HTTP %d", resp.StatusCode)
+	}
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
@@ -819,13 +900,15 @@ func decodeWindsurfUsage(raw map[string]any) providerUsage {
 	} {
 		rem, ok := numberValue(planStatus[cfg.Remaining])
 		if !ok {
-			continue
+			return providerUsage{Provider: "windsurf", OK: false, Error: "quota data unavailable"}
 		}
 		used := math.Round((100-rem)*10) / 10
 		left := math.Round(rem*10) / 10
 		q := quota{Name: cfg.Name, Period: cfg.Period, UsedPct: &used, LeftPct: &left}
 		if resetUnix, ok := numberValue(planStatus[cfg.Reset]); ok && resetUnix > 0 {
 			q.ResetsAt = time.Unix(int64(resetUnix), 0).UTC().Format(time.RFC3339)
+		} else {
+			return providerUsage{Provider: "windsurf", OK: false, Error: "quota data unavailable"}
 		}
 		result.Quotas = append(result.Quotas, q)
 	}
@@ -840,17 +923,7 @@ func decodeWindsurfUsage(raw map[string]any) providerUsage {
 
 func collectCursorUsage() (providerUsage, error) {
 	dbPath := filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb")
-	if _, err := os.Stat(dbPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return providerUsage{Provider: "cursor", OK: false, Error: "not installed"}, nil
-		}
-		return providerUsage{}, err
-	}
-	token, err := sqliteValue(dbPath, "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken' LIMIT 1")
-	if err != nil {
-		return providerUsage{}, err
-	}
-	refreshToken, err := sqliteValue(dbPath, "SELECT value FROM ItemTable WHERE key='cursorAuth/refreshToken' LIMIT 1")
+	token, refreshToken, source, err := readCursorAuth(dbPath)
 	if err != nil {
 		return providerUsage{}, err
 	}
@@ -860,6 +933,7 @@ func collectCursorUsage() (providerUsage, error) {
 	if cursorTokenNeedsRefresh(token) && refreshToken != "" {
 		if newToken, err := refreshCursorToken(refreshToken); err == nil && newToken != "" {
 			token = newToken
+			persistCursorAccessToken(dbPath, source, token)
 		}
 	}
 	if token == "" {
@@ -873,11 +947,69 @@ func collectCursorUsage() (providerUsage, error) {
 	if err != nil {
 		return providerUsage{Provider: "cursor", OK: false, Error: "parse failed"}, nil
 	}
+	if needsCursorRESTFallback(usage, plan) {
+		if fallback := collectCursorRESTUsage(token, plan); fallback.OK {
+			return fallback, nil
+		}
+	}
 	credits, err := doCursorPOST(cursorCreditsURL, token)
 	if err != nil {
-		return providerUsage{Provider: "cursor", OK: false, Error: "parse failed"}, nil
+		credits = nil
 	}
-	return decodeCursorUsage(usage, plan, credits), nil
+	stripeBalance := fetchCursorStripeBalance(token)
+	return decodeCursorUsageWithStripe(usage, plan, credits, stripeBalance), nil
+}
+
+func readCursorAuth(dbPath string) (string, string, string, error) {
+	var sqliteAccess, sqliteRefresh, membership string
+	if _, err := os.Stat(dbPath); err == nil {
+		var readErr error
+		sqliteAccess, readErr = sqliteValue(dbPath, "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken' LIMIT 1")
+		if readErr != nil {
+			return "", "", "", readErr
+		}
+		sqliteRefresh, readErr = sqliteValue(dbPath, "SELECT value FROM ItemTable WHERE key='cursorAuth/refreshToken' LIMIT 1")
+		if readErr != nil {
+			return "", "", "", readErr
+		}
+		membership, _ = sqliteValue(dbPath, "SELECT value FROM ItemTable WHERE key='cursorAuth/stripeMembershipType' LIMIT 1")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", "", err
+	}
+
+	keychainAccess, _ := readKeychainPassword(cursorKeychainAccess)
+	keychainRefresh, _ := readKeychainPassword(cursorKeychainRefresh)
+	sqliteSubject := cursorTokenSubject(sqliteAccess)
+	keychainSubject := cursorTokenSubject(keychainAccess)
+	if (sqliteAccess != "" || sqliteRefresh != "") &&
+		!(strings.EqualFold(strings.TrimSpace(membership), "free") && sqliteSubject != "" && keychainSubject != "" && sqliteSubject != keychainSubject) {
+		return sqliteAccess, sqliteRefresh, "sqlite", nil
+	}
+	if keychainAccess != "" || keychainRefresh != "" {
+		return keychainAccess, keychainRefresh, "keychain", nil
+	}
+	if sqliteAccess != "" || sqliteRefresh != "" {
+		return sqliteAccess, sqliteRefresh, "sqlite", nil
+	}
+	return "", "", "", nil
+}
+
+func cursorTokenSubject(token string) string {
+	payload := parseJWTPayload(token)
+	sub, _ := payload["sub"].(string)
+	sub = strings.TrimSpace(sub)
+	return sub
+}
+
+func persistCursorAccessToken(dbPath, source, token string) {
+	if token == "" {
+		return
+	}
+	if source == "keychain" {
+		_ = writeKeychainPassword(cursorKeychainAccess, token)
+		return
+	}
+	_ = sqliteExec(dbPath, "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('cursorAuth/accessToken', '"+strings.ReplaceAll(token, "'", "''")+"')")
 }
 
 func sqliteValue(dbPath, query string) (string, error) {
@@ -887,6 +1019,11 @@ func sqliteValue(dbPath, query string) (string, error) {
 		return "", nil
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func sqliteExec(dbPath, query string) error {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	return cmd.Run()
 }
 
 func cursorTokenNeedsRefresh(token string) bool {
@@ -947,11 +1084,18 @@ func doCursorPOST(endpoint, token string) (map[string]any, error) {
 }
 
 func decodeCursorUsage(usage, planData, creditsData map[string]any) providerUsage {
+	return decodeCursorUsageWithStripe(usage, planData, creditsData, 0)
+}
+
+func decodeCursorUsageWithStripe(usage, planData, creditsData map[string]any, stripeBalanceCents float64) providerUsage {
 	result := providerUsage{Provider: "cursor", OK: true, CheckedAt: time.Now().UTC().Format(time.RFC3339)}
 	if plan := stringField(nestedMap(planData, "planInfo"), "planName"); plan != "" {
 		result.Plan = plan
 	}
 	pu := nestedMap(usage, "planUsage")
+	if len(pu) == 0 {
+		return providerUsage{Provider: "cursor", OK: false, Error: "no active Cursor subscription"}
+	}
 	if tp, ok := numberValue(pu["totalPercentUsed"]); ok {
 		left := math.Round((100-tp)*10) / 10
 		q := quota{Name: "total", Period: "monthly", UsedPct: &tp, LeftPct: &left}
@@ -976,15 +1120,132 @@ func decodeCursorUsage(usage, planData, creditsData map[string]any) providerUsag
 	if has, _ := creditsData["hasCreditGrants"].(bool); has {
 		totalC, tok := numberValue(creditsData["totalCents"])
 		usedC, uok := numberValue(creditsData["usedCents"])
-		if tok && uok && totalC > 0 {
+		combinedTotal := totalC + stripeBalanceCents
+		if tok && uok && combinedTotal > 0 {
 			result.Credits = map[string]any{
-				"total_usd": math.Round(totalC) / 100,
+				"total_usd": math.Round(combinedTotal) / 100,
 				"used_usd":  math.Round(usedC) / 100,
-				"left_usd":  math.Round(totalC-usedC) / 100,
+				"left_usd":  math.Round(combinedTotal-usedC) / 100,
 			}
+		}
+	} else if stripeBalanceCents > 0 {
+		result.Credits = map[string]any{
+			"total_usd": math.Round(stripeBalanceCents) / 100,
+			"used_usd":  0.0,
+			"left_usd":  math.Round(stripeBalanceCents) / 100,
 		}
 	}
 	return result
+}
+
+func needsCursorRESTFallback(usage, planData map[string]any) bool {
+	if enabled, ok := usage["enabled"].(bool); ok && !enabled {
+		return false
+	}
+	pu := nestedMap(usage, "planUsage")
+	hasPlanUsage := len(pu) > 0
+	_, hasLimit := numberValue(pu["limit"])
+	_, hasTotalPercent := numberValue(pu["totalPercentUsed"])
+	plan := strings.ToLower(strings.TrimSpace(stringField(nestedMap(planData, "planInfo"), "planName")))
+	return (!hasPlanUsage || !hasLimit) && (!hasTotalPercent || plan == "enterprise" || plan == "team")
+}
+
+func collectCursorRESTUsage(token string, planData map[string]any) providerUsage {
+	session := cursorSessionToken(token)
+	if session.UserID == "" || session.Cookie == "" {
+		return providerUsage{Provider: "cursor", OK: false, Error: "request-based usage unavailable"}
+	}
+	req, err := http.NewRequest(http.MethodGet, cursorRESTUsageURL+"?user="+url.QueryEscape(session.UserID), nil)
+	if err != nil {
+		return providerUsage{Provider: "cursor", OK: false, Error: err.Error()}
+	}
+	req.Header.Set("Cookie", "WorkosCursorSessionToken="+session.Cookie)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return providerUsage{Provider: "cursor", OK: false, Error: err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return providerUsage{Provider: "cursor", OK: false, Error: fmt.Sprintf("request-based usage returned HTTP %d", resp.StatusCode)}
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return providerUsage{Provider: "cursor", OK: false, Error: err.Error()}
+	}
+	gpt4 := nestedMap(raw, "gpt-4")
+	used, uok := numberValue(gpt4["numRequests"])
+	limit, lok := numberValue(gpt4["maxRequestUsage"])
+	if !lok || limit <= 0 {
+		return providerUsage{Provider: "cursor", OK: false, Error: "request-based usage unavailable"}
+	}
+	if !uok {
+		used = 0
+	}
+	usedPct := math.Round((used/limit*100)*10) / 10
+	leftPct := math.Round((100-usedPct)*10) / 10
+	result := providerUsage{Provider: "cursor", OK: true, CheckedAt: time.Now().UTC().Format(time.RFC3339)}
+	if plan := stringField(nestedMap(planData, "planInfo"), "planName"); plan != "" {
+		result.Plan = plan
+	}
+	remaining := math.Max(0, limit-used)
+	q := quota{Name: "requests", Period: "monthly", UsedPct: &usedPct, LeftPct: &leftPct, Remaining: &remaining, Total: &limit}
+	if start := stringField(raw, "startOfMonth"); start != "" {
+		if t, ok := parseResetTime(start); ok {
+			q.ResetsAt = t.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		}
+	}
+	result.Quotas = append(result.Quotas, q)
+	return result
+}
+
+type cursorSession struct {
+	UserID string
+	Cookie string
+}
+
+func cursorSessionToken(accessToken string) cursorSession {
+	sub := cursorTokenSubject(accessToken)
+	if sub == "" {
+		return cursorSession{}
+	}
+	parts := strings.Split(sub, "|")
+	userID := parts[0]
+	if len(parts) > 1 {
+		userID = parts[1]
+	}
+	if userID == "" {
+		return cursorSession{}
+	}
+	return cursorSession{UserID: userID, Cookie: userID + "%3A%3A" + accessToken}
+}
+
+func fetchCursorStripeBalance(token string) float64 {
+	session := cursorSessionToken(token)
+	if session.Cookie == "" {
+		return 0
+	}
+	req, err := http.NewRequest(http.MethodGet, cursorStripeURL, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Cookie", "WorkosCursorSessionToken="+session.Cookie)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return 0
+	}
+	balance, ok := numberValue(raw["customerBalance"])
+	if !ok || balance >= 0 {
+		return 0
+	}
+	return math.Abs(balance)
 }
 
 func parseJWTPayload(token string) map[string]any {
@@ -1435,37 +1696,91 @@ func decodeCopilotUsage(raw map[string]any) providerUsage {
 }
 
 func collectCodexUsage() (providerUsage, error) {
-	authPath := filepath.Join(os.Getenv("HOME"), ".codex", "auth.json")
-	if home := os.Getenv("CODEX_HOME"); home != "" {
-		authPath = filepath.Join(home, "auth.json")
-	}
-
-	auth, err := readCodexAuthFile(authPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+	authStates, missingPaths := readCodexAuthStates()
+	if len(authStates) == 0 {
+		if len(missingPaths) > 0 {
 			return providerUsage{Provider: "codex", OK: false, Error: "auth file not found"}, nil
 		}
-		return providerUsage{}, err
-	}
-	if auth.Tokens.AccessToken == "" && auth.Tokens.RefreshToken == "" {
-		return providerUsage{Provider: "codex", OK: false, Error: "no token found"}, nil
+		return providerUsage{Provider: "codex", OK: false, Error: "not logged in"}, nil
 	}
 
-	usage, token, refreshToken, err := fetchCodexUsage(auth)
-	if err != nil {
-		return providerUsage{Provider: "codex", OK: false, Error: err.Error()}, nil
+	var lastErr error
+	for _, authState := range authStates {
+		auth := authState.Auth
+		if auth.OpenAIAPIKey != "" && auth.Tokens.AccessToken == "" && auth.Tokens.RefreshToken == "" {
+			lastErr = errors.New("usage not available for API key")
+			continue
+		}
+		if auth.Tokens.AccessToken == "" && auth.Tokens.RefreshToken == "" {
+			lastErr = errors.New("no token found")
+			continue
+		}
+
+		usage, token, refreshToken, headers, err := fetchCodexUsage(&auth)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if refreshToken != "" && (token != authState.Auth.Tokens.AccessToken || refreshToken != authState.Auth.Tokens.RefreshToken) {
+			auth.Tokens.AccessToken = token
+			auth.Tokens.RefreshToken = refreshToken
+			auth.Tokens.AccountID = codexAccountID(token)
+			auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
+			if err := writeCodexAuthState(authState, auth); err != nil {
+				return providerUsage{}, err
+			}
+		}
+		return decodeCodexUsageWithHeaders(usage, headers), nil
 	}
-	if refreshToken != "" && (token != auth.Tokens.AccessToken || refreshToken != auth.Tokens.RefreshToken) {
-		auth.Tokens.AccessToken = token
-		auth.Tokens.RefreshToken = refreshToken
-		auth.Tokens.AccountID = codexAccountID(token)
-		auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
-		if err := writeCodexAuthFile(authPath, auth); err != nil {
-			return providerUsage{}, err
+
+	if lastErr == nil {
+		lastErr = errors.New("not logged in")
+	}
+	return providerUsage{Provider: "codex", OK: false, Error: lastErr.Error()}, nil
+}
+
+type codexAuthState struct {
+	Auth   codexAuthFile
+	Path   string
+	Source string
+}
+
+func codexAuthPaths() []string {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return []string{filepath.Join(home, "auth.json")}
+	}
+	return []string{
+		filepath.Join(os.Getenv("HOME"), ".config", "codex", "auth.json"),
+		filepath.Join(os.Getenv("HOME"), ".codex", "auth.json"),
+	}
+}
+
+func readCodexAuthStates() ([]codexAuthState, []string) {
+	states := []codexAuthState{}
+	missing := []string{}
+	for _, authPath := range codexAuthPaths() {
+		auth, err := readCodexAuthFile(authPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				missing = append(missing, authPath)
+			}
+			continue
+		}
+		if hasCodexAuth(auth) {
+			states = append(states, codexAuthState{Auth: auth, Path: authPath, Source: "file"})
 		}
 	}
+	if raw, ok := readKeychainPassword(codexKeychainSvc); ok {
+		var auth codexAuthFile
+		if err := parseJSONOrHex(raw, &auth); err == nil && hasCodexAuth(auth) {
+			states = append(states, codexAuthState{Auth: auth, Source: "keychain"})
+		}
+	}
+	return states, missing
+}
 
-	return decodeCodexUsage(usage), nil
+func hasCodexAuth(auth codexAuthFile) bool {
+	return auth.Tokens.AccessToken != "" || auth.Tokens.RefreshToken != "" || auth.OpenAIAPIKey != ""
 }
 
 func readCodexAuthFile(path string) (codexAuthFile, error) {
@@ -1474,7 +1789,7 @@ func readCodexAuthFile(path string) (codexAuthFile, error) {
 	if err != nil {
 		return auth, err
 	}
-	err = json.Unmarshal(data, &auth)
+	err = parseJSONOrHex(string(data), &auth)
 	return auth, err
 }
 
@@ -1486,69 +1801,106 @@ func writeCodexAuthFile(path string, auth codexAuthFile) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-func fetchCodexUsage(auth codexAuthFile) (map[string]any, string, string, error) {
+func writeCodexAuthState(state codexAuthState, auth codexAuthFile) error {
+	if state.Source == "keychain" {
+		data, err := json.Marshal(auth)
+		if err != nil {
+			return err
+		}
+		if writeKeychainPassword(codexKeychainSvc, string(data)) {
+			return nil
+		}
+		return errors.New("failed to write Codex keychain auth")
+	}
+	return writeCodexAuthFile(state.Path, auth)
+}
+
+func fetchCodexUsage(auth *codexAuthFile) (map[string]any, string, string, http.Header, error) {
 	accessToken := auth.Tokens.AccessToken
 	refreshToken := auth.Tokens.RefreshToken
 	accountID := auth.Tokens.AccountID
 	if accountID == "" {
 		accountID = codexAccountID(accessToken)
 	}
+	if codexNeedsProactiveRefresh(*auth) && refreshToken != "" {
+		newAccess, newRefresh, err := refreshCodexAccessToken(refreshToken)
+		if err == nil && newAccess != "" {
+			accessToken = newAccess
+			if newRefresh != "" {
+				refreshToken = newRefresh
+			}
+			accountID = codexAccountID(accessToken)
+		}
+	}
 
-	body, status, err := doCodexUsageRequest(accessToken, accountID)
+	body, status, headers, err := doCodexUsageRequest(accessToken, accountID)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 	if status == http.StatusUnauthorized && refreshToken != "" {
 		newAccess, newRefresh, err := refreshCodexAccessToken(refreshToken)
 		if err != nil {
-			return nil, "", "", err
+			return nil, "", "", nil, err
 		}
 		if newAccess == "" {
-			return nil, "", "", errors.New("codex: token refresh returned empty access token")
+			return nil, "", "", nil, errors.New("codex: token refresh returned empty access token")
 		}
 		accessToken = newAccess
 		if newRefresh != "" {
 			refreshToken = newRefresh
 		}
 		accountID = codexAccountID(accessToken)
-		body, status, err = doCodexUsageRequest(accessToken, accountID)
+		body, status, headers, err = doCodexUsageRequest(accessToken, accountID)
 		if err != nil {
-			return nil, "", "", err
+			return nil, "", "", nil, err
 		}
 	}
 	if status != http.StatusOK {
-		return nil, "", "", fmt.Errorf("api returned HTTP %d", status)
+		return nil, "", "", nil, fmt.Errorf("api returned HTTP %d", status)
 	}
 
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, "", "", fmt.Errorf("parse failed: %w", err)
+		return nil, "", "", nil, fmt.Errorf("parse failed: %w", err)
 	}
-	return raw, accessToken, refreshToken, nil
+	return raw, accessToken, refreshToken, headers, nil
 }
 
-func doCodexUsageRequest(accessToken, accountID string) ([]byte, int, error) {
+func codexNeedsProactiveRefresh(auth codexAuthFile) bool {
+	if auth.LastRefresh == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339, auth.LastRefresh)
+	if err != nil {
+		return true
+	}
+	return time.Since(t) > 8*24*time.Hour
+}
+
+func doCodexUsageRequest(accessToken, accountID string) ([]byte, int, http.Header, error) {
 	if accessToken == "" {
-		return nil, 0, errors.New("no token found")
+		return nil, 0, nil, errors.New("no token found")
 	}
 	req, err := http.NewRequest(http.MethodGet, codexUsageURL, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "OpenUsage")
 	if accountID != "" {
 		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
-	return body, resp.StatusCode, nil
+	return body, resp.StatusCode, resp.Header, nil
 }
 
 func refreshCodexAccessToken(refreshToken string) (string, string, error) {
@@ -1571,6 +1923,24 @@ func refreshCodexAccessToken(refreshToken string) (string, string, error) {
 		return "", "", err
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
+			var raw map[string]any
+			if err := json.Unmarshal(body, &raw); err == nil {
+				code := stringField(nestedMap(raw, "error"), "code")
+				if code == "" {
+					code = stringField(raw, "error")
+				}
+				switch code {
+				case "refresh_token_expired":
+					return "", "", errors.New("session expired, run `codex` to log in again")
+				case "refresh_token_reused":
+					return "", "", errors.New("token conflict, run `codex` to log in again")
+				case "refresh_token_invalidated":
+					return "", "", errors.New("token revoked, run `codex` to log in again")
+				}
+			}
+			return "", "", errors.New("token expired, run `codex` to log in again")
+		}
 		return "", "", fmt.Errorf("token refresh failed with HTTP %d", resp.StatusCode)
 	}
 	var parsed struct {
@@ -1605,28 +1975,48 @@ func codexAccountID(token string) string {
 }
 
 func decodeCodexUsage(raw map[string]any) providerUsage {
+	return decodeCodexUsageWithHeaders(raw, nil)
+}
+
+func decodeCodexUsageWithHeaders(raw map[string]any, headers http.Header) providerUsage {
 	result := providerUsage{
 		Provider:  "codex",
 		OK:        true,
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
-		Plan:      stringField(raw, "plan_type"),
-		Credits: map[string]any{
-			"balance": numberString(nestedMap(raw, "credits")["balance"]),
-		},
+		Plan:      formatCodexPlan(stringField(raw, "plan_type")),
+	}
+	if balance, ok := codexCreditsBalance(raw, headers); ok {
+		result.Credits = map[string]any{"balance": numberString(balance)}
 	}
 
-	result.Quotas = append(result.Quotas, decodeCodexWindow("session", "5h", nestedMap(nestedMap(raw, "rate_limit"), "primary_window"))...)
-	result.Quotas = append(result.Quotas, decodeCodexWindow("weekly", "7d", nestedMap(nestedMap(raw, "rate_limit"), "secondary_window"))...)
+	rateLimit := nestedMap(raw, "rate_limit")
+	primary := nestedMap(rateLimit, "primary_window")
+	secondary := nestedMap(rateLimit, "secondary_window")
+	if used, ok := headerNumber(headers, "X-Codex-Primary-Used-Percent"); ok {
+		result.Quotas = append(result.Quotas, codexQuotaFromUsed("session", "5h", used, primary))
+	} else {
+		result.Quotas = append(result.Quotas, decodeCodexWindow("session", "5h", primary)...)
+	}
+	if used, ok := headerNumber(headers, "X-Codex-Secondary-Used-Percent"); ok {
+		result.Quotas = append(result.Quotas, codexQuotaFromUsed("weekly", "7d", used, secondary))
+	} else {
+		result.Quotas = append(result.Quotas, decodeCodexWindow("weekly", "7d", secondary)...)
+	}
 
 	for _, entry := range sliceMap(raw["additional_rate_limits"]) {
 		name := stringField(entry, "limit_name")
 		if name == "" {
 			name = "model"
+		} else {
+			name = shortenCodexLimitName(name)
 		}
 		rateLimit := nestedMap(entry, "rate_limit")
 		result.Quotas = append(result.Quotas, decodeCodexWindow(name, "5h", nestedMap(rateLimit, "primary_window"))...)
 		result.Quotas = append(result.Quotas, decodeCodexWindow(name+"_weekly", "7d", nestedMap(rateLimit, "secondary_window"))...)
 	}
+
+	reviewWindow := nestedMap(nestedMap(raw, "code_review_rate_limit"), "primary_window")
+	result.Quotas = append(result.Quotas, decodeCodexWindow("reviews", "7d", reviewWindow)...)
 
 	return result
 }
@@ -1636,16 +2026,73 @@ func decodeCodexWindow(name, period string, window map[string]any) []quota {
 	if !ok {
 		return nil
 	}
-	left := math.Round((100-used)*10) / 10
-	q := quota{Name: name, Period: period, UsedPct: &used, LeftPct: &left}
-	if resetAt := codexResetAt(window["reset_at"]); resetAt != "" {
-		q.ResetsAt = resetAt
-	}
+	q := codexQuotaFromUsed(name, period, used, window)
 	return []quota{q}
 }
 
-func codexResetAt(v any) string {
-	switch t := v.(type) {
+func codexQuotaFromUsed(name, period string, used float64, window map[string]any) quota {
+	left := math.Round((100-used)*10) / 10
+	q := quota{Name: name, Period: period, UsedPct: &used, LeftPct: &left}
+	if resetAt := codexResetAt(window); resetAt != "" {
+		q.ResetsAt = resetAt
+	}
+	return q
+}
+
+func formatCodexPlan(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return ""
+	case "prolite":
+		return "Pro 5x"
+	case "pro":
+		return "Pro 20x"
+	default:
+		return raw
+	}
+}
+
+func codexCreditsBalance(raw map[string]any, headers http.Header) (any, bool) {
+	credits := nestedMap(raw, "credits")
+	if balance, ok := credits["balance"]; ok {
+		if _, valid := numberValue(balance); valid {
+			return balance, true
+		}
+		if s, ok := balance.(string); ok && strings.TrimSpace(s) != "" {
+			return s, true
+		}
+	}
+	if has, ok := credits["has_credits"].(bool); ok && !has {
+		return float64(0), true
+	}
+	if value := headers.Get("X-Codex-Credits-Balance"); value != "" {
+		return value, true
+	}
+	return nil, false
+}
+
+func headerNumber(headers http.Header, key string) (float64, bool) {
+	if headers == nil {
+		return 0, false
+	}
+	value := strings.TrimSpace(headers.Get(key))
+	if value == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	return n, err == nil
+}
+
+func shortenCodexLimitName(name string) string {
+	const marker = "-Codex-"
+	if idx := strings.Index(name, marker); idx >= 0 && idx+len(marker) < len(name) {
+		return name[idx+len(marker):]
+	}
+	return name
+}
+
+func codexResetAt(window map[string]any) string {
+	switch t := window["reset_at"].(type) {
 	case string:
 		return t
 	case float64:
@@ -1653,9 +2100,11 @@ func codexResetAt(v any) string {
 			return ""
 		}
 		return time.Unix(int64(t), 0).UTC().Format(time.RFC3339)
-	default:
-		return ""
 	}
+	if seconds, ok := numberValue(window["reset_after_seconds"]); ok && seconds >= 0 {
+		return time.Now().Add(time.Duration(seconds) * time.Second).UTC().Format(time.RFC3339)
+	}
+	return ""
 }
 
 func nestedMap(m map[string]any, key string) map[string]any {
@@ -1693,6 +2142,9 @@ func numberValue(v any) (float64, bool) {
 		return float64(n), true
 	case json.Number:
 		value, err := n.Float64()
+		return value, err == nil
+	case string:
+		value, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
 		return value, err == nil
 	default:
 		return 0, false
@@ -1903,6 +2355,31 @@ func resetDisplay(value string) string {
 	countdown := humanDurationUntil(t)
 	local := t.Local().Format("2006-01-02 15:04")
 	return fmt.Sprintf("reset in %s (%s)", countdown, local)
+}
+
+func retryAfterDisplay(headers http.Header) string {
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return ""
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return minutesDisplay(time.Duration(seconds) * time.Second)
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		wait := time.Until(t)
+		if wait < 0 {
+			wait = 0
+		}
+		return minutesDisplay(wait)
+	}
+	return ""
+}
+
+func minutesDisplay(d time.Duration) string {
+	if d <= 0 {
+		return "now"
+	}
+	return fmt.Sprintf("%dm", int(math.Ceil(d.Minutes())))
 }
 
 func resetAgentFields(value string) (string, string) {
