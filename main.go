@@ -2208,20 +2208,10 @@ func (a app) printHumanProviders(providers []providerUsage) {
 		title := strings.Title(provider.Provider)
 		fmt.Fprintf(a.stdout, "%s (%s)\n", title, provider.Provider)
 		if provider.Plan != "" {
-			fmt.Fprintf(a.stdout, "  plan      %s\n", provider.Plan)
+			fmt.Fprintf(a.stdout, "Plan: %s\n", provider.Plan)
 		}
 		for _, q := range provider.Quotas {
-			fmt.Fprintf(a.stdout, "  %-9s %s %s left", q.Name, progressBar(q.UsedPct), percentString(q.LeftPct))
-			if q.Remaining != nil && q.Total != nil {
-				fmt.Fprintf(a.stdout, "  %.0f/%.0f", *q.Remaining, *q.Total)
-			}
-			if q.UsedDollars != nil && q.LimitDollars != nil {
-				fmt.Fprintf(a.stdout, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
-			}
-			if q.ResetsAt != "" {
-				fmt.Fprintf(a.stdout, "  · %s", resetDisplay(q.ResetsAt))
-			}
-			fmt.Fprintln(a.stdout)
+			printHumanQuota(a.stdout, provider.Provider, q)
 		}
 		if provider.Credits != nil {
 			printCreditsHuman(a.stdout, provider.Provider, provider.Credits)
@@ -2233,6 +2223,73 @@ func (a app) printHumanProviders(providers []providerUsage) {
 			printMapHuman(a.stdout, "extra", provider.ExtraUsageBalance)
 		}
 	}
+}
+
+func printHumanQuota(w io.Writer, provider string, q quota) {
+	fmt.Fprintf(w, "\n%s\n", humanQuotaTitle(provider, q.Name))
+	fmt.Fprintf(w, "%s %s used", usageProgressBar(q.UsedPct), usedPercentString(q.UsedPct))
+	if q.Remaining != nil && q.Total != nil {
+		fmt.Fprintf(w, "  %s", countUsageString(q))
+	}
+	if q.UsedDollars != nil && q.LimitDollars != nil {
+		fmt.Fprintf(w, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
+	}
+	fmt.Fprintln(w)
+	if q.ResetsAt != "" {
+		fmt.Fprintf(w, "Resets %s\n", resetUsageDisplay(q.ResetsAt))
+	}
+}
+
+func humanQuotaTitle(provider, name string) string {
+	switch name {
+	case "session":
+		return "Current session"
+	case "weekly":
+		if provider == "claude" || provider == "codex" {
+			return "Current week (all models)"
+		}
+		return "Current week"
+	case "sonnet_weekly":
+		return "Current week (Sonnet only)"
+	case "opus_weekly":
+		return "Current week (Opus only)"
+	case "design_weekly":
+		return "Current week (Claude Design)"
+	case "daily":
+		return "Current day"
+	case "total":
+		return "Current month"
+	case "auto":
+		return "Auto usage"
+	case "api":
+		return "API usage"
+	case "premium":
+		return "Premium requests"
+	case "chat":
+		return "Chat"
+	case "completions":
+		return "Completions"
+	case "reviews":
+		return "Reviews"
+	case "requests":
+		return "Requests"
+	default:
+		return titleFromSlug(name)
+	}
+}
+
+func titleFromSlug(value string) string {
+	words := strings.Fields(strings.ReplaceAll(strings.ReplaceAll(value, "_", " "), "-", " "))
+	for i, word := range words {
+		if word == "" {
+			continue
+		}
+		words[i] = strings.ToUpper(word[:1]) + word[1:]
+	}
+	if len(words) == 0 {
+		return "Usage"
+	}
+	return strings.Join(words, " ")
 }
 
 func (a app) printAgentProvider(provider providerUsage) {
@@ -2261,18 +2318,18 @@ func (a app) printAgentProvider(provider providerUsage) {
 func printCreditsHuman(w io.Writer, provider string, credits map[string]any) {
 	switch provider {
 	case "codex":
-		fmt.Fprintf(w, "  credits   %v left\n", credits["balance"])
+		fmt.Fprintf(w, "\nCredits: %v left\n", credits["balance"])
 	case "cursor":
 		left, lok := credits["left_usd"]
 		total, tok := credits["total_usd"]
 		used, uok := credits["used_usd"]
 		if lok && tok && uok {
-			fmt.Fprintf(w, "  credits   $%v left  ($%v used / $%v total)\n", left, used, total)
+			fmt.Fprintf(w, "\nCredits: $%v left ($%v used / $%v total)\n", left, used, total)
 			return
 		}
-		fmt.Fprintf(w, "  credits   %v\n", credits)
+		fmt.Fprintf(w, "\nCredits: %v\n", credits)
 	default:
-		fmt.Fprintf(w, "  credits   %v\n", credits)
+		fmt.Fprintf(w, "\nCredits: %v\n", credits)
 	}
 }
 
@@ -2293,7 +2350,7 @@ func printMapHuman(w io.Writer, label string, values map[string]any) {
 		chunks = append(chunks, fmt.Sprintf("%s=%v", k, v))
 	}
 	sort.Strings(chunks)
-	fmt.Fprintf(w, "  %-9s %s\n", label, strings.Join(chunks, " "))
+	fmt.Fprintf(w, "\n%s: %s\n", strings.Title(label), strings.Join(chunks, " "))
 }
 
 func progressBar(usedPercent *float64) string {
@@ -2318,6 +2375,48 @@ func progressBar(usedPercent *float64) string {
 	const reset = "\033[0m"
 	blocks := colorCode + strings.Repeat("█", filled) + reset + strings.Repeat("░", width-filled)
 	return "[" + blocks + "]"
+}
+
+func usageProgressBar(usedPercent *float64) string {
+	const width = 50
+	if usedPercent == nil {
+		return strings.Repeat("░", width)
+	}
+	p := math.Max(0, math.Min(100, *usedPercent))
+	filled := int(math.Round((p / 100) * width))
+	if p > 0 && filled == 0 {
+		filled = 1
+	}
+	if filled > width {
+		filled = width
+	}
+	var colorCode string
+	switch {
+	case p >= 80:
+		colorCode = "\033[31m"
+	case p >= 50:
+		colorCode = "\033[33m"
+	default:
+		colorCode = "\033[38;5;147m"
+	}
+	const reset = "\033[0m"
+	return colorCode + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + reset
+}
+
+func usedPercentString(usedPercent *float64) string {
+	if usedPercent == nil {
+		return "n/a"
+	}
+	value := math.Round(*usedPercent)
+	return fmt.Sprintf("%.0f%%", value)
+}
+
+func countUsageString(q quota) string {
+	if q.Remaining == nil || q.Total == nil {
+		return ""
+	}
+	used := math.Max(0, *q.Total-*q.Remaining)
+	return fmt.Sprintf("%.0f/%.0f", used, *q.Total)
 }
 
 func percentString(percent *float64) string {
@@ -2355,6 +2454,24 @@ func resetDisplay(value string) string {
 	countdown := humanDurationUntil(t)
 	local := t.Local().Format("2006-01-02 15:04")
 	return fmt.Sprintf("reset in %s (%s)", countdown, local)
+}
+
+func resetUsageDisplay(value string) string {
+	t, ok := parseResetTime(value)
+	if !ok {
+		return value
+	}
+	locationName := time.Now().Location().String()
+	if time.Until(t) < 24*time.Hour && sameLocalDate(t, time.Now()) {
+		return fmt.Sprintf("%s (%s)", t.Local().Format("3:04pm"), locationName)
+	}
+	return fmt.Sprintf("%s (%s)", t.Local().Format("Jan 2 at 3:04am"), locationName)
+}
+
+func sameLocalDate(a, b time.Time) bool {
+	al := a.Local()
+	bl := b.Local()
+	return al.Year() == bl.Year() && al.YearDay() == bl.YearDay()
 }
 
 func retryAfterDisplay(headers http.Header) string {

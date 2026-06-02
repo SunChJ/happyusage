@@ -95,6 +95,26 @@ func TestUsageProviderJSONOutput(t *testing.T) {
 	})
 }
 
+func TestUsageProviderHumanOutputUsesUsageBlocks(t *testing.T) {
+	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", UsedPct: numPtr(25), LeftPct: numPtr(75), ResetsAt: "2099-01-01T12:00:00Z"}, {Name: "weekly", UsedPct: numPtr(40), LeftPct: numPtr(60)}}}}
+	withMockCollector(results, nil, func() {
+		var stdout, stderr bytes.Buffer
+		exitCode := MainWithIO("hu", []string{"usage", "claude"}, &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("expected exit 0, got %d, stderr=%s", exitCode, stderr.String())
+		}
+		got := stdout.String()
+		for _, want := range []string{"Claude (claude)", "Plan: Pro", "Current session", "25% used", "Resets ", "Current week (all models)", "40% used"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("expected human output to contain %q, got: %s", want, got)
+			}
+		}
+		if strings.Contains(got, "75.0% left") {
+			t.Fatalf("human output still uses old left-based line: %s", got)
+		}
+	})
+}
+
 func TestRunUsageStatusLoopRendersFrame(t *testing.T) {
 	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", UsedPct: numPtr(25), LeftPct: numPtr(75)}}}}
 	withMockCollector(results, nil, func() {
