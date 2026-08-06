@@ -32,6 +32,7 @@ var embeddedAgentScript string
 
 type quota struct {
 	Name         string   `json:"name"`
+	DisplayName  string   `json:"-"`
 	Period       string   `json:"period,omitempty"`
 	UsedPct      *float64 `json:"used_pct,omitempty"`
 	LeftPct      *float64 `json:"left_pct,omitempty"`
@@ -1992,33 +1993,77 @@ func decodeCodexUsageWithHeaders(raw map[string]any, headers http.Header) provid
 	rateLimit := nestedMap(raw, "rate_limit")
 	primary := nestedMap(rateLimit, "primary_window")
 	secondary := nestedMap(rateLimit, "secondary_window")
+	primaryPeriod := codexWindowPeriod(primary, "5h")
+	primaryName := codexQuotaName("session", primaryPeriod)
 	if used, ok := headerNumber(headers, "X-Codex-Primary-Used-Percent"); ok {
-		result.Quotas = append(result.Quotas, codexQuotaFromUsed("session", "5h", used, primary))
+		result.Quotas = append(result.Quotas, codexQuotaFromUsed(primaryName, primaryPeriod, used, primary))
 	} else {
-		result.Quotas = append(result.Quotas, decodeCodexWindow("session", "5h", primary)...)
+		result.Quotas = append(result.Quotas, decodeCodexWindow(primaryName, primaryPeriod, primary)...)
 	}
+	secondaryPeriod := codexWindowPeriod(secondary, "7d")
 	if used, ok := headerNumber(headers, "X-Codex-Secondary-Used-Percent"); ok {
-		result.Quotas = append(result.Quotas, codexQuotaFromUsed("weekly", "7d", used, secondary))
+		result.Quotas = append(result.Quotas, codexQuotaFromUsed("weekly", secondaryPeriod, used, secondary))
 	} else {
-		result.Quotas = append(result.Quotas, decodeCodexWindow("weekly", "7d", secondary)...)
+		result.Quotas = append(result.Quotas, decodeCodexWindow("weekly", secondaryPeriod, secondary)...)
 	}
 
 	for _, entry := range sliceMap(raw["additional_rate_limits"]) {
-		name := stringField(entry, "limit_name")
+		displayName := stringField(entry, "limit_name")
+		name := displayName
 		if name == "" {
 			name = "model"
 		} else {
 			name = shortenCodexLimitName(name)
 		}
 		rateLimit := nestedMap(entry, "rate_limit")
-		result.Quotas = append(result.Quotas, decodeCodexWindow(name, "5h", nestedMap(rateLimit, "primary_window"))...)
-		result.Quotas = append(result.Quotas, decodeCodexWindow(name+"_weekly", "7d", nestedMap(rateLimit, "secondary_window"))...)
+		primaryWindow := nestedMap(rateLimit, "primary_window")
+		primaryPeriod := codexWindowPeriod(primaryWindow, "5h")
+		primaryQuotas := decodeCodexWindow(codexQuotaName(name, primaryPeriod), primaryPeriod, primaryWindow)
+		secondaryWindow := nestedMap(rateLimit, "secondary_window")
+		secondaryPeriod := codexWindowPeriod(secondaryWindow, "7d")
+		secondaryQuotas := decodeCodexWindow(codexQuotaName(name, secondaryPeriod), secondaryPeriod, secondaryWindow)
+		for i := range primaryQuotas {
+			primaryQuotas[i].DisplayName = displayName
+		}
+		for i := range secondaryQuotas {
+			secondaryQuotas[i].DisplayName = displayName
+		}
+		result.Quotas = append(result.Quotas, primaryQuotas...)
+		result.Quotas = append(result.Quotas, secondaryQuotas...)
 	}
 
 	reviewWindow := nestedMap(nestedMap(raw, "code_review_rate_limit"), "primary_window")
 	result.Quotas = append(result.Quotas, decodeCodexWindow("reviews", "7d", reviewWindow)...)
 
 	return result
+}
+
+func codexWindowPeriod(window map[string]any, fallback string) string {
+	seconds, ok := numberValue(window["limit_window_seconds"])
+	if !ok || seconds <= 0 {
+		return fallback
+	}
+	switch {
+	case seconds <= 6*60*60:
+		return "5h"
+	case seconds >= 6*24*60*60:
+		return "7d"
+	default:
+		return fallback
+	}
+}
+
+func codexQuotaName(base, period string) string {
+	if period != "7d" {
+		return base
+	}
+	if base == "session" {
+		return "weekly"
+	}
+	if strings.HasSuffix(base, "_weekly") {
+		return base
+	}
+	return base + "_weekly"
 }
 
 func decodeCodexWindow(name, period string, window map[string]any) []quota {
@@ -2210,9 +2255,7 @@ func (a app) printHumanProviders(providers []providerUsage) {
 		if provider.Plan != "" {
 			fmt.Fprintf(a.stdout, "Plan: %s\n", provider.Plan)
 		}
-		for _, q := range provider.Quotas {
-			printHumanQuota(a.stdout, provider.Provider, q)
-		}
+		printHumanQuotas(a.stdout, provider.Provider, provider.Quotas)
 		if provider.Credits != nil {
 			printCreditsHuman(a.stdout, provider.Provider, provider.Credits)
 		}
@@ -2225,19 +2268,82 @@ func (a app) printHumanProviders(providers []providerUsage) {
 	}
 }
 
-func printHumanQuota(w io.Writer, provider string, q quota) {
-	fmt.Fprintf(w, "\n%s\n", humanQuotaTitle(provider, q.Name))
-	fmt.Fprintf(w, "%s %s used", usageProgressBar(q.UsedPct), usedPercentString(q.UsedPct))
-	if q.Remaining != nil && q.Total != nil {
-		fmt.Fprintf(w, "  %s", countUsageString(q))
+func printHumanQuotas(w io.Writer, provider string, quotas []quota) {
+	if len(quotas) == 0 {
+		return
 	}
-	if q.UsedDollars != nil && q.LimitDollars != nil {
-		fmt.Fprintf(w, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
+
+	labels := make([]string, len(quotas))
+	labelWidth := 0
+	for i, q := range quotas {
+		labels[i] = humanQuotaLabel(provider, q)
+		if width := len(labels[i]); width > labelWidth {
+			labelWidth = width
+		}
 	}
+
 	fmt.Fprintln(w)
-	if q.ResetsAt != "" {
-		fmt.Fprintf(w, "Resets %s\n", resetUsageDisplay(q.ResetsAt))
+	for i, q := range quotas {
+		left := quotaLeftPercent(q)
+		fmt.Fprintf(w, "%s:%*s%s %s left", labels[i], labelWidth-len(labels[i])+1, "", remainingProgressBar(left), wholePercentString(left))
+		if q.Remaining != nil && q.Total != nil {
+			fmt.Fprintf(w, "  %s", countUsageString(q))
+		}
+		if q.UsedDollars != nil && q.LimitDollars != nil {
+			fmt.Fprintf(w, "  $%.2f/$%.2f", *q.UsedDollars, *q.LimitDollars)
+		}
+		if q.ResetsAt != "" {
+			fmt.Fprintf(w, " (resets %s)", codexResetDisplay(q.ResetsAt))
+		}
+		fmt.Fprintln(w)
 	}
+}
+
+func quotaLeftPercent(q quota) *float64 {
+	if q.LeftPct != nil {
+		return q.LeftPct
+	}
+	if q.UsedPct == nil {
+		return nil
+	}
+	left := 100 - *q.UsedPct
+	return &left
+}
+
+func humanQuotaLabel(provider string, q quota) string {
+	if q.DisplayName != "" {
+		if provider == "codex" {
+			return q.DisplayName + " " + codexLimitLabel(q.Period)
+		}
+		return q.DisplayName
+	}
+
+	switch q.Name {
+	case "session":
+		if provider == "codex" {
+			return codexLimitLabel(q.Period)
+		}
+		return "Session limit"
+	case "weekly":
+		return "Weekly limit"
+	case "sonnet_weekly":
+		return "Sonnet Weekly limit"
+	case "opus_weekly":
+		return "Opus Weekly limit"
+	case "design_weekly":
+		return "Claude Design Weekly limit"
+	}
+	if strings.HasSuffix(q.Name, "_weekly") {
+		return strings.TrimSuffix(q.Name, "_weekly") + " Weekly limit"
+	}
+	return humanQuotaTitle(provider, q.Name)
+}
+
+func codexLimitLabel(period string) string {
+	if period == "7d" {
+		return "Weekly limit"
+	}
+	return "5h limit"
 }
 
 func humanQuotaTitle(provider, name string) string {
@@ -2377,38 +2483,21 @@ func progressBar(usedPercent *float64) string {
 	return "[" + blocks + "]"
 }
 
-func usageProgressBar(usedPercent *float64) string {
-	const width = 50
-	if usedPercent == nil {
-		return strings.Repeat("░", width)
+func remainingProgressBar(leftPercent *float64) string {
+	const width = 20
+	if leftPercent == nil {
+		return "[" + strings.Repeat("?", width) + "]"
 	}
-	p := math.Max(0, math.Min(100, *usedPercent))
-	filled := int(math.Round((p / 100) * width))
-	if p > 0 && filled == 0 {
-		filled = 1
-	}
-	if filled > width {
-		filled = width
-	}
-	var colorCode string
-	switch {
-	case p >= 80:
-		colorCode = "\033[31m"
-	case p >= 50:
-		colorCode = "\033[33m"
-	default:
-		colorCode = "\033[38;5;147m"
-	}
-	const reset = "\033[0m"
-	return colorCode + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + reset
+	left := math.Max(0, math.Min(100, *leftPercent))
+	filled := int(math.Round(left / 100 * width))
+	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
 }
 
-func usedPercentString(usedPercent *float64) string {
-	if usedPercent == nil {
+func wholePercentString(percent *float64) string {
+	if percent == nil {
 		return "n/a"
 	}
-	value := math.Round(*usedPercent)
-	return fmt.Sprintf("%.0f%%", value)
+	return fmt.Sprintf("%.0f%%", math.Round(*percent))
 }
 
 func countUsageString(q quota) string {
@@ -2456,22 +2545,12 @@ func resetDisplay(value string) string {
 	return fmt.Sprintf("reset in %s (%s)", countdown, local)
 }
 
-func resetUsageDisplay(value string) string {
+func codexResetDisplay(value string) string {
 	t, ok := parseResetTime(value)
 	if !ok {
 		return value
 	}
-	locationName := time.Now().Location().String()
-	if time.Until(t) < 24*time.Hour && sameLocalDate(t, time.Now()) {
-		return fmt.Sprintf("%s (%s)", t.Local().Format("3:04pm"), locationName)
-	}
-	return fmt.Sprintf("%s (%s)", t.Local().Format("Jan 2 at 3:04am"), locationName)
-}
-
-func sameLocalDate(a, b time.Time) bool {
-	al := a.Local()
-	bl := b.Local()
-	return al.Year() == bl.Year() && al.YearDay() == bl.YearDay()
+	return t.Local().Format("15:04 on 2 Jan")
 }
 
 func retryAfterDisplay(headers http.Header) string {

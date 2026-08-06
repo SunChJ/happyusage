@@ -95,8 +95,8 @@ func TestUsageProviderJSONOutput(t *testing.T) {
 	})
 }
 
-func TestUsageProviderHumanOutputUsesUsageBlocks(t *testing.T) {
-	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", UsedPct: numPtr(25), LeftPct: numPtr(75), ResetsAt: "2099-01-01T12:00:00Z"}, {Name: "weekly", UsedPct: numPtr(40), LeftPct: numPtr(60)}}}}
+func TestUsageProviderHumanOutputUsesCodexStyleRows(t *testing.T) {
+	results := []providerUsage{{Provider: "claude", OK: true, Plan: "Pro", Quotas: []quota{{Name: "session", UsedPct: numPtr(71), LeftPct: numPtr(29)}, {Name: "weekly", UsedPct: numPtr(69), LeftPct: numPtr(31), ResetsAt: "2099-08-09T12:01:00Z"}}}}
 	withMockCollector(results, nil, func() {
 		var stdout, stderr bytes.Buffer
 		exitCode := MainWithIO("hu", []string{"usage", "claude"}, &stdout, &stderr)
@@ -104,15 +104,38 @@ func TestUsageProviderHumanOutputUsesUsageBlocks(t *testing.T) {
 			t.Fatalf("expected exit 0, got %d, stderr=%s", exitCode, stderr.String())
 		}
 		got := stdout.String()
-		for _, want := range []string{"Claude (claude)", "Plan: Pro", "Current session", "25% used", "Resets ", "Current week (all models)", "40% used"} {
+		for _, want := range []string{
+			"Claude (claude)",
+			"Plan: Pro",
+			"Session limit: [██████░░░░░░░░░░░░░░] 29% left",
+			"Weekly limit:  [██████░░░░░░░░░░░░░░] 31% left (resets ",
+			" on 9 Aug)",
+		} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("expected human output to contain %q, got: %s", want, got)
 			}
 		}
-		if strings.Contains(got, "75.0% left") {
-			t.Fatalf("human output still uses old left-based line: %s", got)
+		if strings.Contains(got, "% used") {
+			t.Fatalf("human output still uses used percentage: %s", got)
 		}
 	})
+}
+
+func TestHumanQuotaLabelFormatsCodexWeeklyLimits(t *testing.T) {
+	tests := []struct {
+		quota quota
+		want  string
+	}{
+		{quota: quota{Name: "session", Period: "5h"}, want: "5h limit"},
+		{quota: quota{Name: "weekly", Period: "7d"}, want: "Weekly limit"},
+		{quota: quota{Name: "Spark_weekly", DisplayName: "GPT-5.3-Codex-Spark", Period: "7d"}, want: "GPT-5.3-Codex-Spark Weekly limit"},
+		{quota: quota{Name: "Spark", DisplayName: "GPT-5.3-Codex-Spark", Period: "5h"}, want: "GPT-5.3-Codex-Spark 5h limit"},
+	}
+	for _, tt := range tests {
+		if got := humanQuotaLabel("codex", tt.quota); got != tt.want {
+			t.Fatalf("humanQuotaLabel() = %q, want %q", got, tt.want)
+		}
+	}
 }
 
 func TestRunUsageStatusLoopRendersFrame(t *testing.T) {
@@ -333,6 +356,53 @@ func TestDecodeCodexUsage(t *testing.T) {
 	}
 }
 
+func TestDecodeCodexUsageDetectsActiveWindowPeriods(t *testing.T) {
+	raw := map[string]any{
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{"used_percent": float64(71), "limit_window_seconds": float64(7 * 24 * 60 * 60)},
+		},
+		"additional_rate_limits": []any{
+			map[string]any{
+				"limit_name": "GPT-5.3-Codex-Spark",
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{"used_percent": float64(69), "limit_window_seconds": float64(7 * 24 * 60 * 60)},
+				},
+			},
+		},
+	}
+
+	got := decodeCodexUsage(raw)
+	if len(got.Quotas) != 2 {
+		t.Fatalf("expected 2 weekly quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "weekly" || got.Quotas[0].Period != "7d" {
+		t.Fatalf("unexpected primary weekly quota: %+v", got.Quotas[0])
+	}
+	if got.Quotas[1].Name != "Spark_weekly" || got.Quotas[1].Period != "7d" || got.Quotas[1].DisplayName != "GPT-5.3-Codex-Spark" {
+		t.Fatalf("unexpected model weekly quota: %+v", got.Quotas[1])
+	}
+}
+
+func TestDecodeCodexUsageKeepsFiveHourWindowCompatibility(t *testing.T) {
+	raw := map[string]any{
+		"rate_limit": map[string]any{
+			"primary_window":   map[string]any{"used_percent": float64(20), "limit_window_seconds": float64(5 * 60 * 60)},
+			"secondary_window": map[string]any{"used_percent": float64(40), "limit_window_seconds": float64(7 * 24 * 60 * 60)},
+		},
+	}
+
+	got := decodeCodexUsage(raw)
+	if len(got.Quotas) != 2 {
+		t.Fatalf("expected 5h and weekly quotas, got %+v", got.Quotas)
+	}
+	if got.Quotas[0].Name != "session" || got.Quotas[0].Period != "5h" {
+		t.Fatalf("unexpected 5h quota: %+v", got.Quotas[0])
+	}
+	if got.Quotas[1].Name != "weekly" || got.Quotas[1].Period != "7d" {
+		t.Fatalf("unexpected weekly quota: %+v", got.Quotas[1])
+	}
+}
+
 func TestDecodeCodexUsageUsesHeadersAndReviewLimit(t *testing.T) {
 	raw := map[string]any{
 		"plan_type": "pro",
@@ -370,8 +440,8 @@ func TestDecodeCodexUsageUsesHeadersAndReviewLimit(t *testing.T) {
 	if got.Quotas[0].Name != "session" || got.Quotas[0].UsedPct == nil || *got.Quotas[0].UsedPct != 15 {
 		t.Fatalf("unexpected session quota: %+v", got.Quotas[0])
 	}
-	if got.Quotas[2].Name != "Thinking" {
-		t.Fatalf("expected shortened additional limit name, got %+v", got.Quotas[2])
+	if got.Quotas[2].Name != "Thinking" || got.Quotas[2].DisplayName != "GPT-5.1-Codex-Thinking" {
+		t.Fatalf("expected stable machine name and full display name, got %+v", got.Quotas[2])
 	}
 	if got.Quotas[3].Name != "reviews" {
 		t.Fatalf("expected reviews quota, got %+v", got.Quotas[3])
