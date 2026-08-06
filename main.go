@@ -108,11 +108,11 @@ func (s *spinner) Stop() {
 }
 
 type usageOptions struct {
-	JSON   bool
-	Agent  bool
-	Status bool
-	Target string
-	Action string
+	JSON    bool
+	Agent   bool
+	Status  bool
+	Targets []string
+	Action  string
 }
 
 type codexAuthFile struct {
@@ -242,10 +242,13 @@ func parseUsageArgs(args []string) (usageOptions, error) {
 	}
 	if len(positionals) > 0 {
 		if positionals[0] == "list" {
+			if len(positionals) > 1 {
+				return usageOptions{}, errors.New("usage list does not take provider arguments")
+			}
 			opts.Action = "list"
 		} else {
 			opts.Action = "provider"
-			opts.Target = positionals[0]
+			opts.Targets = append([]string(nil), positionals...)
 		}
 	}
 	return opts, nil
@@ -272,30 +275,28 @@ func (a app) runUsage(opts usageOptions) int {
 	switch opts.Action {
 	case "provider":
 		stop := a.showSpinner(opts)
-		results, err := collectUsageFn([]string{opts.Target})
+		results, err := collectUsageFn(opts.Targets)
 		stop()
 		if err != nil {
 			return a.renderUsageError(opts, err)
 		}
 		if len(results) == 0 {
-			return a.renderUsageError(opts, fmt.Errorf("provider not found: %s", opts.Target))
+			return a.renderUsageError(opts, fmt.Errorf("provider not found: %s", strings.Join(opts.Targets, ", ")))
 		}
-		provider := results[0]
 		if opts.JSON {
-			a.writeJSON(jsonEnvelope{OK: provider.OK, Source: "native_provider_scripts", CheckedAt: now, Provider: &provider, Error: provider.Error})
-			if provider.OK {
-				return 0
-			}
-			return 1
+			return a.renderUsageJSON(opts, now, results)
 		}
-		if !provider.OK {
-			return a.exitErr(fmt.Errorf("%s: %s", provider.Provider, provider.Error))
+		configured := configuredProviders(results)
+		if len(configured) == 0 {
+			return a.exitErr(fmt.Errorf("%s: %s", results[0].Provider, results[0].Error))
 		}
 		if opts.Agent {
-			a.printAgentProvider(provider)
+			for _, provider := range configured {
+				a.printAgentProvider(provider)
+			}
 			return 0
 		}
-		a.printHumanProviders([]providerUsage{provider})
+		a.printHumanProviders(configured)
 		return 0
 	case "list":
 		stop := a.showSpinner(opts)
@@ -370,14 +371,15 @@ func (a app) renderUsageStatusFrame(opts usageOptions) int {
 
 	switch opts.Action {
 	case "provider":
-		results, err = collectUsageFn([]string{opts.Target})
+		results, err = collectUsageFn(opts.Targets)
 		if err != nil {
 			return a.exitErr(err)
 		}
 		if len(results) == 0 {
-			return a.exitErr(fmt.Errorf("provider not found: %s", opts.Target))
+			return a.exitErr(fmt.Errorf("provider not found: %s", strings.Join(opts.Targets, ", ")))
 		}
-		if !results[0].OK {
+		results = configuredProviders(results)
+		if len(results) == 0 {
 			return a.exitErr(fmt.Errorf("%s: %s", results[0].Provider, results[0].Error))
 		}
 	case "all":
@@ -397,6 +399,25 @@ func (a app) renderUsageStatusFrame(opts usageOptions) int {
 
 	fmt.Fprint(a.stdout, "\033[H\033[2J")
 	_, _ = io.Copy(a.stdout, &body)
+	return 0
+}
+
+func (a app) renderUsageJSON(opts usageOptions, now string, results []providerUsage) int {
+	configured := configuredProviders(results)
+	if len(configured) == 0 {
+		msg := "no active subscription"
+		if len(results) > 0 && results[0].Error != "" {
+			msg = fmt.Sprintf("%s: %s", results[0].Provider, results[0].Error)
+		}
+		a.writeJSON(jsonEnvelope{OK: false, Source: "native_provider_scripts", CheckedAt: now, Error: msg})
+		return 1
+	}
+	if len(opts.Targets) == 1 {
+		provider := configured[0]
+		a.writeJSON(jsonEnvelope{OK: true, Source: "native_provider_scripts", CheckedAt: now, Provider: &provider})
+		return 0
+	}
+	a.writeJSON(jsonEnvelope{OK: true, Source: "native_provider_scripts", CheckedAt: now, ProviderCount: len(configured), Providers: configured})
 	return 0
 }
 
@@ -764,6 +785,9 @@ func doClaudeUsageRequest(token string) (map[string]any, error) {
 }
 
 func decodeClaudeUsage(raw map[string]any) providerUsage {
+	if enabled, ok := raw["is_enabled"].(bool); ok && !enabled {
+		return providerUsage{Provider: "claude", OK: false, Error: "no active subscription"}
+	}
 	result := providerUsage{
 		Provider:  "claude",
 		OK:        true,
@@ -793,12 +817,16 @@ func decodeClaudeUsage(raw map[string]any) providerUsage {
 		result.Quotas = append(result.Quotas, q)
 	}
 	extra := nestedMap(raw, "extra_usage")
-	if enabled, _ := extra["is_enabled"].(bool); enabled {
+	extraEnabled, _ := extra["is_enabled"].(bool)
+	if extraEnabled {
 		result.ExtraUsage = map[string]any{
 			"enabled":   true,
 			"used_usd":  extra["used_credits"],
 			"limit_usd": extra["monthly_limit"],
 		}
+	}
+	if len(result.Quotas) == 0 && !extraEnabled {
+		return providerUsage{Provider: "claude", OK: false, Error: "no active subscription"}
 	}
 	return result
 }
@@ -2237,7 +2265,7 @@ func (a app) printUsageHelp() {
 	fmt.Fprintf(a.stdout, "hu usage — check provider usage quotas and reset times\n\n")
 	fmt.Fprintf(a.stdout, "Usage:\n")
 	fmt.Fprintf(a.stdout, "  %s usage                        show all providers\n", a.progName)
-	fmt.Fprintf(a.stdout, "  %s usage <provider>              show a single provider\n", a.progName)
+	fmt.Fprintf(a.stdout, "  %s usage <provider...>           show one or more providers\n", a.progName)
 	fmt.Fprintf(a.stdout, "  %s usage list                    list available provider IDs\n\n", a.progName)
 	fmt.Fprintf(a.stdout, "Flags:\n")
 	fmt.Fprintf(a.stdout, "  --agent    compact text for AI agents\n")

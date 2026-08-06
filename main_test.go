@@ -19,8 +19,24 @@ func TestParseUsageArgsStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseUsageArgs returned error: %v", err)
 	}
-	if !opts.Status || opts.Target != "claude" || opts.Action != "provider" {
+	if !opts.Status || len(opts.Targets) != 1 || opts.Targets[0] != "claude" || opts.Action != "provider" {
 		t.Fatalf("unexpected opts: %+v", opts)
+	}
+}
+
+func TestParseUsageArgsMultipleProviders(t *testing.T) {
+	opts, err := parseUsageArgs([]string{"claude", "codex", "--agent"})
+	if err != nil {
+		t.Fatalf("parseUsageArgs returned error: %v", err)
+	}
+	if opts.Action != "provider" || len(opts.Targets) != 2 || opts.Targets[0] != "claude" || opts.Targets[1] != "codex" || !opts.Agent {
+		t.Fatalf("unexpected opts: %+v", opts)
+	}
+}
+
+func TestParseUsageArgsListRejectsProviders(t *testing.T) {
+	if _, err := parseUsageArgs([]string{"list", "claude"}); err == nil {
+		t.Fatal("expected parseUsageArgs to reject list with provider arguments")
 	}
 }
 
@@ -193,6 +209,67 @@ func TestExtractClaudeAccessTokenFromHexPayload(t *testing.T) {
 	raw := hex.EncodeToString([]byte(`{"claudeAiOauth":{"accessToken":"claude-token"}}`))
 	if got := extractClaudeAccessToken(raw); got != "claude-token" {
 		t.Fatalf("unexpected token: %q", got)
+	}
+}
+
+func TestUsageMultipleProvidersJSONOnlyShowsSubscribed(t *testing.T) {
+	results := []providerUsage{
+		{Provider: "claude", OK: false, Error: "no active subscription"},
+		{Provider: "codex", OK: true, Plan: "Pro 5x", Quotas: []quota{{Name: "weekly", Period: "7d", LeftPct: numPtr(29)}}},
+	}
+	withMockCollector(results, nil, func() {
+		var stdout, stderr bytes.Buffer
+		exitCode := MainWithIO("hu", []string{"usage", "claude", "codex", "--json"}, &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("expected exit 0, got %d, stderr=%s", exitCode, stderr.String())
+		}
+		got := stdout.String()
+		if strings.Contains(got, "claude") {
+			t.Fatalf("json output exposes unsubscribed provider: %s", got)
+		}
+		if !strings.Contains(got, "\"provider_count\": 1") || !strings.Contains(got, "\"provider\": \"codex\"") {
+			t.Fatalf("unexpected multi-provider json output: %s", got)
+		}
+	})
+}
+
+func TestUsageSingleProviderJSONNoSubscription(t *testing.T) {
+	results := []providerUsage{{Provider: "claude", OK: false, Error: "no active subscription"}}
+	withMockCollector(results, nil, func() {
+		var stdout, stderr bytes.Buffer
+		exitCode := MainWithIO("hu", []string{"usage", "claude", "--json"}, &stdout, &stderr)
+		if exitCode != 1 {
+			t.Fatalf("expected exit 1, got %d, stderr=%s", exitCode, stderr.String())
+		}
+		got := stdout.String()
+		if strings.Contains(got, "\"provider\":") {
+			t.Fatalf("json output exposes unsubscribed provider: %s", got)
+		}
+		if !strings.Contains(got, "\"ok\": false") || !strings.Contains(got, "no active subscription") {
+			t.Fatalf("unexpected json output: %s", got)
+		}
+	})
+}
+
+func TestDecodeClaudeUsageNoSubscription(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  map[string]any
+	}{
+		{name: "explicit disabled", raw: map[string]any{"is_enabled": false}},
+		{name: "empty windows", raw: map[string]any{
+			"five_hour":   map[string]any{},
+			"seven_day":   map[string]any{},
+			"extra_usage": map[string]any{"is_enabled": false},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := decodeClaudeUsage(tt.raw)
+			if got.OK || got.Error != "no active subscription" || len(got.Quotas) != 0 {
+				t.Fatalf("unexpected no-subscription result: %+v", got)
+			}
+		})
 	}
 }
 

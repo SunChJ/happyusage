@@ -52,10 +52,11 @@ hu update
 ```bash
 hu usage                        # all providers, human-friendly
 hu usage <provider>              # single provider
+hu usage <provider> <provider>   # multiple providers
 hu usage list                    # list available provider IDs
-hu usage [provider] --status     # keep usage visible and refresh every 30s
-hu usage [provider] --agent      # compact text for AI agents (recommended for agent use)
-hu usage [provider] --json       # structured JSON for web UI / integrations / debugging
+hu usage [provider...] --status  # keep usage visible and refresh every 30s
+hu usage [provider...] --agent   # compact text for AI agents (recommended for agent use)
+hu usage [provider...] --json    # structured JSON for web UI / integrations / debugging
 ```
 
 If you are building or prompting an AI agent, prefer `--agent` by default. Use `--json` only when you explicitly need structured output for integrations, UI rendering, or debugging.
